@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from html.parser import HTMLParser
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -62,7 +63,22 @@ def viewer_url(port: int, route: str) -> str:
     return f"http://{DEFAULT_HOST}:{port}{route}"
 
 
-def inspect_server(port: int, official_plan: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+class ViewerPageParser(HTMLParser):
+    marker = False
+    app = False
+    script = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "meta" and attributes.get("name") == "schedule-assistant-viewer" and attributes.get("content") == "1":
+            self.marker = True
+        if attributes.get("id") == "app":
+            self.app = True
+        if tag == "script" and attributes.get("type") == "module" and attributes.get("src"):
+            self.script = True
+
+
+def inspect_server(port: int, official_plan: dict[str, Any], workspace: Path) -> tuple[str, dict[str, Any]]:
     endpoint = f"http://{DEFAULT_HOST}:{port}/plan.json"
     request = Request(endpoint, headers={"Cache-Control": "no-cache"})
     try:
@@ -70,6 +86,8 @@ def inspect_server(port: int, official_plan: dict[str, Any]) -> tuple[str, dict[
         opener = build_opener(ProxyHandler({}))
         with opener.open(request, timeout=1.0) as response:
             source = response.headers.get("X-Plan-Source", "official")
+            identity = response.headers.get("X-Schedule-Viewer")
+            workspace_key = response.headers.get("X-Plan-Workspace")
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         return "conflict", {"http_status": error.code}
@@ -82,6 +100,21 @@ def inspect_server(port: int, official_plan: dict[str, Any]) -> tuple[str, dict[
         return "conflict", {"source": "fixture"}
     if payload != official_plan:
         return "conflict", {"source": "different_plan"}
+    if identity != "1":
+        return "conflict", {"source": "not_viewer"}
+    if workspace_key != hashlib.sha256(str(workspace.resolve()).encode("utf-8")).hexdigest():
+        return "conflict", {"source": "different_workspace"}
+    root = viewer_url(port, "/")
+    try:
+        with opener.open(Request(root, headers={"Cache-Control": "no-cache"}), timeout=1.0) as response:
+            if response.geturl() != root or response.headers.get_content_type() != "text/html":
+                return "conflict", {"source": "viewer_page_invalid"}
+            page = ViewerPageParser()
+            page.feed(response.read().decode("utf-8"))
+            if not (page.marker and page.app and page.script):
+                return "conflict", {"source": "viewer_page_invalid"}
+    except (OSError, URLError, UnicodeDecodeError) as error:
+        return "conflict", {"source": "viewer_page_unavailable", "detail": type(error).__name__}
     return "running", {}
 
 
@@ -153,7 +186,7 @@ def main() -> int:
         )
 
     url = viewer_url(arguments.port, route)
-    server_state, details = inspect_server(arguments.port, official_plan)
+    server_state, details = inspect_server(arguments.port, official_plan, workspace)
     if server_state == "running":
         return emit(
             {
@@ -240,7 +273,7 @@ def main() -> int:
                 },
                 4,
             )
-        server_state, details = inspect_server(arguments.port, official_plan)
+        server_state, details = inspect_server(arguments.port, official_plan, workspace)
         if server_state == "running":
             return emit(
                 {

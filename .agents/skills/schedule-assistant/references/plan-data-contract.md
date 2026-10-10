@@ -1,23 +1,25 @@
 # 正式计划数据合同
 
-在初始化 `plan.json`、读取或修改正式数据、构造待提交候选、解释字段、开发校验脚本，或让 viewer 消费计划时读取本文。
+需要确定 `plan.json` 的字段含义、引用关系或写入要求时，按下面的问题定位章节。正式数据已足以回答的查询，不必先阅读整份合同。
+
+构造完整候选时读取 §1 公共约定、§11 更新关系和本次受影响字段；保留已有合法且未受影响的数据，不必为复制原值展开所有对象定义。初始化读 §1～3；临时精确预览与正式提交的操作见 [提交操作](plan-write-workflow.md)，普通查询或讨论不加载写入流程。
 
 本文只回答：已经确定的正式事实怎样保存在 `plan.json`。任务为什么这样建模、Todo 怎样排时间、过去实际做了多少、哪些变化需要确认，分别由其他 reference 决定。
 
 ## 按问题查找
 
-| 当前问题 | 读取章节 |
-| --- | --- |
-| 数据模块全貌、依赖关系或空计划 | 1～2 |
-| 版本、时区、进度确认点 | 3 |
-| Goal / Recurring / Habit 字段 | 4 |
-| Node 字段 | 5 |
-| Todo、归属、依赖字段 | 6 |
-| TimeConstraint 与循环例外 | 7 |
-| AvailabilityRules | 8 |
-| Schedule / ScheduleEntry | 9 |
-| 哪些内容不得持久化 | 10 |
-| 修改后要同步更新什么 | 11 |
+| 要解决的问题 | 章节与定位词 | 需要连读的条件 |
+| --- | --- | --- |
+| 模块关系、初始化空壳 | §2：五个顶层模块、合法空计划 | 初始化连读 §1、§3 |
+| 版本、时区、进度确认点存哪里 | §3：`PlanMeta` | 核对截止点怎样确定按进度规则；不从元数据推断实际完成 |
+| 任务状态、剩余工作、归属、依赖 | §6.1：Todo 公共字段；§6.2：`parent_refs` | 涉及上层对象才读 §4.1 Goal、§5 Node |
+| Recurring 实例和模板怎样保存 | §4.2：`recurrence`；§4.3：`cycle_template` | 生成实例再读 §5 Node、§6 Todo 中的周期身份 |
+| Habit 频次、周期及本期 Todo | §4.4：`habit_rule`；§6.1：Todo | 达标/加次的业务口径见任务结构 §9；不把频次字段当成完成次数 |
+| 独立占用、单次跳过或改期 | §7.1：TimeConstraint 公共字段；§7.2：循环字段与例外 | 修改具体投影再读 §9.4 |
+| 每日可用时间与日期覆盖 | §8.1：AvailabilityRules；§8.2：`date_overrides` | 单条 Todo 越界例外由 §9.3 保存，不改默认画像 |
+| 日程窗口、条目身份、具体起止时间 | §9.1：Schedule；§9.2：ScheduleEntry 公共字段 | Todo 条目读 §9.3，占用条目读 §9.4；引用/不复制的事实见 §9.5 |
+| 日排名、用户指定顺序、可用时间例外 | §9.3：`daily_rank`、`ranking_exception`、`availability_exception` | 排名算法和授权分别见排期 §7、确认规则 §7.3/§9 |
+| 临时推断能否保存、修改后同步什么 | §10：不持久化的内容；§11：权威更新关系 | 写入始终连读 §1及受影响字段 |
 
 ## 1. 合同约定
 
@@ -69,7 +71,7 @@ availability_rules ─┘
 - `availability_rules` 不被 Schedule 消耗或改写。运行时用它生成基础候选时间，再扣除 TimeConstraint 和需要保留的 ScheduleEntry。
 - Goal、Node、Todo 和 TimeConstraint 可以在尚未排期时独立存在；没有 ScheduleEntry 不代表对象无效或已完成。
 - 上游权威事实变化时，应重新判断受影响的 ScheduleEntry；只移动 ScheduleEntry 时，不应反向修改任务、占用或可用时间规则。
-- Schedule 大部分是可重建投影；`availability_exception` 是窄例外，由对应 Todo ScheduleEntry 权威保存。用户同时修改 DDL、事件或其他上游事实时，先更新对应权威模块，再生成新的 Schedule。
+- Schedule 大部分是可重建投影；`availability_exception` 及日期级 `ranking_exception` 与对应用户指定顺序由 Todo ScheduleEntry 保存，重建时必须保留相应授权和选择。用户同时修改 DDL、事件或其他上游事实时，先更新对应权威模块，再生成新的 Schedule。
 
 ### 2.3 合法空计划
 
@@ -144,7 +146,7 @@ availability_rules ─┘
 | `type` | enum | 是 | `linear`、`recurring` 或 `habit` |
 | `status` | enum | 是 | `active`、`paused`、`completed` 或 `cancelled`；Recurring/Habit 不得使用 `completed` |
 | `priority` | enum | 是 | `P0`、`P1` 或 `P2`，表示长期相对重要性 |
-| `outcome` | string | 是 | Goal 期望结果或持续状态 |
+| `outcome` | string | 是 | Goal 期望结果或持续状态；Habit 记录行为服务的目的，不是周期次数达标公式 |
 | `deadline` | datetime/null | 是 | Linear Goal 经确认的精确 DDL；没有时为 `null` |
 | `recurrence` | object/null | 是 | Recurring 专属日期锚点规则 |
 | `cycle_template` | object/null | 是 | Recurring 每轮任务模板 |
@@ -158,7 +160,7 @@ availability_rules ─┘
 | Goal 类型 | `deadline` | `recurrence` | `cycle_template` | `habit_rule` |
 | --- | --- | --- | --- | --- |
 | `linear` | datetime/null | `null` | `null` | `null` |
-| `recurring` | `null` | object | object | `null` |
+| `recurring` | `null` | object/null | object/null | `null` |
 | `habit` | `null` | `null` | `null` | object |
 
 Goal 不保存 Node ID 列表、通用进度、是否已排期、逾期、风险、独立完成标准或具体执行时间。
@@ -176,14 +178,18 @@ Goal 不保存 Node ID 列表、通用进度、是否已排期、逾期、风险
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `interval` | integer | 是 | 大于 0 |
-| `unit` | enum | 是 | v0 支持 `week`、`month` |
-| `first_cycle_starts_on` | date | 是 | 首轮开始日期锚点 |
-| `first_deadline` | datetime | 是 | 首轮精确 DDL 及后续 DDL 锚点 |
+| `interval` | integer/null | 是 | 已知时大于 0；与 unit 成对已知或成对为空 |
+| `unit` | enum/null | 是 | 已知时为 `week`、`month` |
+| `first_cycle_starts_on` | date/null | 是 | 首个周期的日期锚点，允许待定 |
+| `first_deadline` | datetime/null | 是 | 实际存在的首期硬 DDL 及后续 DDL 锚点；可空，不早于首个周期开始日 |
 
-`recurrence` 只保存日期规则，不保存每轮行动。
+`recurrence` 只保存日期规则，不保存每轮行动；完全未知时为 null，对象存在时全部键保留、未知值用 null。比如已知每两周但起点未定，可以保留 interval=2、unit=week，两项日期为空。周期边界不是硬 DDL。
+
+规则和模板不完整时仍允许建立 Recurring Goal、当前 Node/Todo 和日程；按规则生成的条件和已有实例绑定见 task-structure §8，不保存额外 ready 状态。
 
 ### 4.3 `cycle_template`
+
+流程未稳定时为 null；提供对象时必须完整，todos 至少包含一项。模板只用于每期节点及其任务，普通节点和直属任务不进入模板。
 
 ```json
 {
@@ -221,6 +227,8 @@ Goal 不保存 Node ID 列表、通用进度、是否已排期、逾期、风险
 模板不保存正式对象 ID、状态、绝对日期或 ScheduleEntry。
 
 ### 4.4 `habit_rule`
+
+沿用 Goal.outcome 保存最终期望结果，habit_rule 保存执行规则；不新增支持目标字段或强制建立第二个 Goal。周期达标仅看实际完成次数，不从次数推断 outcome 实现；完整语义与生成时机见任务结构 §2、§9。
 
 ```json
 {
@@ -281,16 +289,22 @@ Goal 不保存 Node ID 列表、通用进度、是否已排期、逾期、风险
 | `title` | string | 是 | 简短名称 |
 | `outcome` | string | 是 | 该阶段或周期要达到的结果 |
 | `status` | enum | 是 | `pending`、`in_progress`、`completed`、`cancelled` |
-| `starts_on` | date/null | 是 | 可开始日期；Recurring Node 使用周期开始日 |
-| `deadline` | datetime/null | 是 | 精确 DDL；Recurring Node 必填并由已确认规则推导 |
+| `kind` | enum | 新格式必填 | `regular` 普通成果节点；`cycle` 每期节点，仅属于 Recurring |
+| `cycle_starts_on` | date/null | 新格式必填 | 所属周期身份；regular 为 null；未绑定的 cycle 可为 null |
+| `starts_on` | date/null | 是 | 实际可开始日期，与周期身份分开 |
+| `deadline` | datetime/null | 是 | 真实精确 DDL；未确定或没有硬截止时为 null |
 | `depends_on_node_ids` | array<string> | 是 | 前置 Node ID；无依赖为空数组 |
 | `context` | string/null | 是 | 仅影响本 Node 的背景 |
 | `created_at` | datetime | 是 | 创建时间 |
 | `updated_at` | datetime | 是 | 最后修改时间 |
 
-Recurring Node 的稳定身份是 `(goal_id, starts_on)`；已取消 Node 仍占用该身份。
+Linear 仅使用 regular；Recurring 可同时有 regular 和 cycle；Habit 不包含 Node。两类节点均直接属于 Goal，不嵌套。
 
-Node 不保存类型、Todo ID 列表、进度比例、总估时、逾期、完成时间、独立完成规则或通用优先级。
+绑定后 cycle 的稳定身份是 `(goal_id, cycle_starts_on)`；已取消节点仍占用身份。未绑定节点靠 id 保持身份，绑定时复用原对象；改期或改未来规则不改变已有绑定。实际 starts_on 可以与 cycle_starts_on 不同，deadline 也不用于识别周期。
+
+旧格式兼容：仅在 kind 和 cycle_starts_on 同时缺失时，按旧合同解释。Recurring 下旧节点为 cycle，旧 starts_on 是周期身份，仍要求原 starts_on 和 deadline；Linear 下旧节点为 regular。仅缺一个新字段非法。读取不修改源文件；新增或重构节点显式写新字段。旧周期改实际 starts_on 前先显式保存原周期身份。补字段仍按现有 updated_at 规则记录内容变化，不触发语义不变的结构发现。
+
+Node 不保存 Todo ID 列表、进度比例、总估时、逾期、完成时间、独立完成规则或通用优先级。
 
 ## 6. Todo
 
@@ -501,6 +515,10 @@ Schedule 不保存自己的 ID、版本、时区或 `schedule_by_date`。日期�
 
 Todo 条目不得同时保存 `time_constraint_id`。Todo 可以对应多个 ScheduleEntry；多个条目表示多次计划投入，不是多个 Todo。
 
+同一 Todo 日程条目的单纯改期，直接更新原条目的 `starts_at`、`ends_at`，保留 `id` 和 `todo_id`；不另建一条日程再留下旧副本。用户明确该次完全未执行时，即使原时段已过或覆盖当前时刻，也按原条目改期，不留下假执行片段、不因时间流逝扣减剩余量。实际执行过的部分不适用整条迁移；拆分、合并或新增一次投入也不等同于单纯改期，按进度及重排规则处理。
+
+跨版本保存时，`ends_at <=` 修改前正式 `progress_reviewed_through` 的 Todo 条目只能保留原 ID、Todo 引用和原起止时刻；不得新增、迁入、改时或换绑任务。排名重算不改变其历史身份。该边界使用旧确认点，不阻止本次正常核对推进确认点；也不禁止将明确完全未执行的原条目改到合法未来时段。事后进度补充更新 Todo 事实，不补造过去日程；具体规则见 `progress-review.md` 第 9 节。此检查针对 Todo 核对范围，TimeConstraint 投影仍按其自身规则校验。
+
 ### 9.4 TimeConstraint ScheduleEntry
 
 | 字段 | 类型 | 必填 | 说明 |
@@ -513,7 +531,7 @@ TimeConstraint 投影 ID 重建后可以变化；稳定 occurrence 身份只保�
 
 ### 9.5 Schedule 不复制的事实
 
-ScheduleEntry 不保存源对象标题、状态、归属、DDL、弹性时间窗、完成状态、实际时长、锁定、循环 occurrence 身份、创建时间或更新时间。除 `availability_exception` 外，Schedule 应能从其他权威模块重建。
+ScheduleEntry 不保存源对象标题、状态、归属、DDL、弹性时间窗、完成状态、实际时长、锁定、循环 occurrence 身份、创建时间或更新时间。普通投影与算法排名可由源事实派生，但 `availability_exception`、日期级 `ranking_exception` 及对应用户指定顺序不能从其他模块恢复，重建时不得丢弃；既有条目身份、需保留时间和历史仍按本章及重排规则保护。
 
 ## 10. 不持久化的内容
 

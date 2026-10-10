@@ -13,11 +13,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from validate_discovery import validate as validate_discovery
-from validate_plan import Validator, load_classifications, parse_cli_datetime, parse_datetime_value
+from validate_plan import Validator, load_classifications, node_cycle_fields, parse_cli_datetime, parse_datetime_value
 
 
 class ApplyFailure(Exception):
@@ -261,6 +261,70 @@ def comparable_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     return value
 
 
+def compare_reviewed_entries(
+    current: Dict[str, Any], candidate: Dict[str, Any]
+) -> List[Dict[str, str]]:
+    """Do not backfill reviewed Todo slots; keep forward rescheduling possible.
+
+    Review covers ended Todo entries, not TimeConstraint projections. Use the
+    persisted checkpoint so completing a new review in this commit is allowed.
+    Ranking text and equivalent timezone representations are not history edits.
+    """
+    checkpoint = parse_datetime_value(current.get("plan_meta", {}).get("progress_reviewed_through"))
+    if checkpoint is None:
+        return []
+    old_entries = collection_by_id(current, ("schedule", "entries"))
+    errors = []
+    for entry_id, entry in collection_by_id(candidate, ("schedule", "entries")).items():
+        end = parse_datetime_value(entry.get("ends_at"))
+        if entry.get("source_type") != "todo" or end is None or end > checkpoint:
+            continue
+        old = old_entries.get(entry_id, {})
+        if (
+            old.get("source_type") == "todo"
+            and old.get("todo_id") == entry.get("todo_id")
+            and parse_datetime_value(old.get("starts_at")) == parse_datetime_value(entry.get("starts_at"))
+            and parse_datetime_value(old.get("ends_at")) == end
+        ):
+            continue
+        errors.append({
+            "code": "reviewed_history_changed",
+            "path": f"$.schedule.entries[{entry_id}]",
+            "message": "cannot add, retime, or reassign a Todo entry ending at or before the saved progress_reviewed_through; preserve existing history or move an explicitly unstarted entry to a valid future time",
+        })
+    return errors
+
+
+def compare_unreviewed_removals(
+    current: Dict[str, Any], candidate: Dict[str, Any], commit_time: datetime
+) -> List[Dict[str, str]]:
+    """Keep ended Todo entries available until review covers their original end.
+
+    Walk the old entries: a candidate-only check cannot see deletions. A review
+    and cleanup may commit together, so use the candidate checkpoint here.
+    Retaining the same entry and Todo allows explicitly unstarted work to move
+    forward without advancing the global review checkpoint.
+    """
+    checkpoint = parse_datetime_value(candidate.get("plan_meta", {}).get("progress_reviewed_through"))
+    new_entries = collection_by_id(candidate, ("schedule", "entries"))
+    errors = []
+    for entry_id, entry in collection_by_id(current, ("schedule", "entries")).items():
+        end = parse_datetime_value(entry.get("ends_at"))
+        if entry.get("source_type") != "todo" or end is None or end > commit_time:
+            continue
+        if checkpoint is not None and end <= checkpoint:
+            continue
+        new = new_entries.get(entry_id, {})
+        if new.get("source_type") == "todo" and new.get("todo_id") == entry.get("todo_id"):
+            continue
+        errors.append({
+            "code": "unreviewed_history_removed",
+            "path": f"$.schedule.entries[{entry_id}]",
+            "message": "cannot remove or reassign an ended Todo entry before actual progress review covers its original end; preserve its entry and Todo identity when rescheduling explicitly unstarted work",
+        })
+    return errors
+
+
 def has_task_structure(plan: Dict[str, Any]) -> bool:
     structure = plan.get("task_structure")
     if not isinstance(structure, dict):
@@ -280,25 +344,111 @@ def requires_first_discovery(current: Dict[str, Any], candidate: Dict[str, Any])
     )
 
 
-def has_unowned_dependency_chain(plan: Dict[str, Any]) -> bool:
+def dependency_ids(item: Dict[str, Any], field: str) -> Set[str]:
+    value = item.get(field)
+    return {entry for entry in value if isinstance(entry, str)} if isinstance(value, list) else set()
+
+
+def relation_signature(value: Any) -> Any:
+    """Compare relation collections without giving storage order business meaning.
+
+    This is not validation: duplicates and malformed values still reach Validator.
+    """
+    if isinstance(value, list):
+        return sorted(json.dumps(entry, sort_keys=True) for entry in value)
+    return value
+
+
+def unowned_dependency_endpoints(plan: Dict[str, Any]) -> Set[str]:
     todos = collection_by_id(plan, ("task_structure", "todos"))
-    for todo_item in todos.values():
-        dependencies = todo_item.get("depends_on_todo_ids")
-        if todo_item.get("parent_refs") or not isinstance(dependencies, list):
+    endpoints: Set[str] = set()
+    for todo_id, todo_item in todos.items():
+        if todo_item.get("parent_refs"):
             continue
-        for dependency_id in dependencies:
+        for dependency_id in dependency_ids(todo_item, "depends_on_todo_ids"):
             predecessor = todos.get(dependency_id)
             if predecessor is not None and not predecessor.get("parent_refs"):
-                return True
-    return False
+                endpoints.update((todo_id, dependency_id))
+    return endpoints
 
 
 def requires_repair_discovery(current: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
-    affected_content_changed = (
-        current.get("task_structure") != candidate.get("task_structure")
-        or current.get("schedule") != candidate.get("schedule")
-    )
-    return affected_content_changed and has_unowned_dependency_chain(current)
+    suspect = unowned_dependency_endpoints(current)
+    if not suspect:
+        return False
+
+    old_todos = collection_by_id(current, ("task_structure", "todos"))
+    new_todos = collection_by_id(candidate, ("task_structure", "todos"))
+    successors: Dict[str, Set[str]] = {}
+    predecessors: Dict[str, Set[str]] = {}
+    for todos in (old_todos, new_todos):
+        for todo_id, item in todos.items():
+            for dependency in dependency_ids(item, "depends_on_todo_ids"):
+                successors.setdefault(dependency, set()).add(todo_id)
+                predecessors.setdefault(todo_id, set()).add(dependency)
+
+    forward: Set[str] = set()
+    backward: Set[str] = set()
+    for todo_id in old_todos.keys() | new_todos.keys():
+        old, new = old_todos.get(todo_id, {}), new_todos.get(todo_id, {})
+        if not old or not new:
+            forward.add(todo_id)
+        if any(old.get(field) != new.get(field) for field in (
+            "status", "remaining_estimate_minutes", "execution_mode", "intensity",
+        )) or relation_signature(old.get("parent_refs")) != relation_signature(new.get("parent_refs")):
+            forward.add(todo_id)
+        changed_edges = dependency_ids(old, "depends_on_todo_ids") ^ dependency_ids(new, "depends_on_todo_ids")
+        if changed_edges:
+            forward.update(changed_edges | {todo_id})
+        if any(old.get(field) != new.get(field) for field in ("deadline", "execution_window")):
+            forward.add(todo_id)
+            backward.add(todo_id)
+
+    # Propagate only along actual ownership paths; shared dates/titles/priority
+    # do not make unrelated branches part of a structural audit.
+    def owned_todos(kind: str, object_ids: Set[str]) -> Set[str]:
+        result: Set[str] = set()
+        for todos in (old_todos, new_todos):
+            for todo_id, item in todos.items():
+                refs = item.get("parent_refs")
+                if isinstance(refs, list) and any(
+                    isinstance(ref, dict) and isinstance(ref.get(kind), str)
+                    and ref[kind] in object_ids for ref in refs
+                ):
+                    result.add(todo_id)
+        return result
+
+    for collection, ref_key in (("goals", "goal_id"), ("nodes", "node_id")):
+        old_items = collection_by_id(current, ("task_structure", collection))
+        new_items = collection_by_id(candidate, ("task_structure", collection))
+        for object_id in old_items.keys() | new_items.keys():
+            old, new = old_items.get(object_id, {}), new_items.get(object_id, {})
+            if old.get("status") != new.get("status"):
+                forward.update(owned_todos(ref_key, {object_id}))
+            if old.get("deadline") != new.get("deadline"):
+                affected = owned_todos(ref_key, {object_id})
+                forward.update(affected)
+                backward.update(affected)
+            if collection == "nodes":
+                changed_edges = dependency_ids(old, "depends_on_node_ids") ^ dependency_ids(new, "depends_on_node_ids")
+                if changed_edges or old.get("goal_id") != new.get("goal_id"):
+                    forward.update(owned_todos(ref_key, changed_edges | {object_id}))
+
+    def reaches_suspect(seeds: Set[str], graph: Dict[str, Set[str]]) -> bool:
+        pending = list(seeds)
+        visited: Set[str] = set()
+        while pending:
+            item = pending.pop()
+            if item in suspect:
+                return True
+            if item not in visited:
+                visited.add(item)
+                pending.extend(graph.get(item, set()) - visited)
+        return False
+
+    # Keep the walks separate: reaching a predecessor must not fan out into
+    # its unrelated sibling branches. Old edges remain visible after removal.
+    return reaches_suspect(forward, successors) or reaches_suspect(backward, predecessors)
 
 
 def requires_incremental_discovery(current: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
@@ -306,6 +456,11 @@ def requires_incremental_discovery(current: Dict[str, Any], candidate: Dict[str,
     candidate_goals = collection_by_id(candidate, ("task_structure", "goals"))
     if set(candidate_goals) - set(current_goals):
         return True
+    for goal_id, old_goal in current_goals.items():
+        new_goal = candidate_goals.get(goal_id)
+        if new_goal and any(old_goal.get(field) != new_goal.get(field)
+                            for field in ("type", "recurrence", "cycle_template")):
+            return True
 
     current_nodes = collection_by_id(current, ("task_structure", "nodes"))
     candidate_nodes = collection_by_id(candidate, ("task_structure", "nodes"))
@@ -315,8 +470,12 @@ def requires_incremental_discovery(current: Dict[str, Any], candidate: Dict[str,
         candidate_node = candidate_nodes.get(node_id)
         if candidate_node is None:
             continue
+        if node_cycle_fields(current_node, current_goals.get(current_node.get("goal_id"), {})) != node_cycle_fields(
+            candidate_node, candidate_goals.get(candidate_node.get("goal_id"), {})
+        ):
+            return True
         for field in ("goal_id", "depends_on_node_ids"):
-            if current_node.get(field) != candidate_node.get(field):
+            if relation_signature(current_node.get(field)) != relation_signature(candidate_node.get(field)):
                 return True
 
     current_todos = collection_by_id(current, ("task_structure", "todos"))
@@ -328,16 +487,40 @@ def requires_incremental_discovery(current: Dict[str, Any], candidate: Dict[str,
                 return True
             continue
         for field in ("parent_refs", "depends_on_todo_ids"):
-            if current_todo.get(field) != candidate_todo.get(field):
+            if relation_signature(current_todo.get(field)) != relation_signature(candidate_todo.get(field)):
                 return True
     return False
 
 
+def compare_cycle_identities(current: Dict[str, Any], candidate: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Once bound, cycle identity survives moves, cancellation and future rule changes."""
+    old_goals = collection_by_id(current, ("task_structure", "goals"))
+    new_goals = collection_by_id(candidate, ("task_structure", "goals"))
+    new_nodes = collection_by_id(candidate, ("task_structure", "nodes"))
+    errors = []
+    for node_id, old in collection_by_id(current, ("task_structure", "nodes")).items():
+        kind, anchor = node_cycle_fields(old, old_goals.get(old.get("goal_id"), {}))
+        new = new_nodes.get(node_id)
+        if kind != "cycle" or anchor is None or new is None:
+            continue
+        new_kind, new_anchor = node_cycle_fields(new, new_goals.get(new.get("goal_id"), {}))
+        if (old.get("goal_id"), kind, anchor) != (new.get("goal_id"), new_kind, new_anchor):
+            errors.append({
+                "code": "cycle_identity_changed",
+                "path": f"$.task_structure.nodes[{node_id}]",
+                "message": "bound cycle identity is immutable; preserve kind, goal_id and cycle_starts_on when moving work or changing future rules",
+            })
+    return errors
+
+
 def cross_version_errors(
-    current: Dict[str, Any], candidate: Dict[str, Any]
+    current: Dict[str, Any], candidate: Dict[str, Any], commit_time: datetime
 ) -> List[Dict[str, str]]:
     errors = compare_progress_checkpoint(current, candidate)
+    errors.extend(compare_cycle_identities(current, candidate))
     errors.extend(compare_persistent_objects(current, candidate))
+    errors.extend(compare_reviewed_entries(current, candidate))
+    errors.extend(compare_unreviewed_removals(current, candidate, commit_time))
     old_schedule = current.get("schedule")
     new_schedule = candidate.get("schedule")
     if isinstance(old_schedule, dict) and isinstance(new_schedule, dict):
@@ -489,7 +672,7 @@ def apply_plan(
             if current_updated and commit_time < current_updated:
                 raise ApplyFailure("commit_time_rollback", "commit time cannot be earlier than the official plan updated_at")
 
-            version_errors = cross_version_errors(current, candidate)
+            version_errors = cross_version_errors(current, candidate, commit_time)
             if version_errors:
                 return 1, failure_result("cross_version_validation_failed", "candidate violates cross-version invariants", version_errors)
 

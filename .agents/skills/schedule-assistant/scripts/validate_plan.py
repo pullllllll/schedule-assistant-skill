@@ -35,6 +35,7 @@ NODE_FIELDS = {
     "id", "goal_id", "title", "outcome", "status", "starts_on", "deadline",
     "depends_on_node_ids", "context", "created_at", "updated_at",
 }
+NODE_CYCLE_FIELDS = {"kind", "cycle_starts_on"}
 TODO_FIELDS = {
     "id", "title", "parent_refs", "status", "deadline", "execution_window",
     "remaining_estimate_minutes", "execution_mode", "intensity", "depends_on_todo_ids",
@@ -44,6 +45,14 @@ TIME_CONSTRAINT_FIELDS = {
     "id", "kind", "title", "status", "starts_at", "ends_at", "recurrence",
     "context", "created_at", "updated_at",
 }
+
+
+def node_cycle_fields(node: Dict[str, Any], goal: Dict[str, Any]) -> Tuple[Any, Any]:
+    """Read old nodes without mutating them; partial new fields are not legacy."""
+    if not NODE_CYCLE_FIELDS.intersection(node):
+        recurring = goal.get("type") == "recurring"
+        return ("cycle", node.get("starts_on")) if recurring else ("regular", None)
+    return node.get("kind"), node.get("cycle_starts_on")
 
 
 def is_int(value: Any) -> bool:
@@ -287,8 +296,10 @@ class Validator:
             elif goal_type == "recurring":
                 if goal.get("habit_rule") is not None:
                     self.error("goal_type_fields", f"{path}.habit_rule", "must be null for a recurring goal")
-                self.validate_goal_recurrence(goal.get("recurrence"), f"{path}.recurrence")
-                self.validate_cycle_template(goal.get("cycle_template"), f"{path}.cycle_template")
+                if goal.get("recurrence") is not None:
+                    self.validate_goal_recurrence(goal.get("recurrence"), f"{path}.recurrence")
+                if goal.get("cycle_template") is not None:
+                    self.validate_cycle_template(goal.get("cycle_template"), f"{path}.cycle_template")
             elif goal_type == "habit":
                 for field in ("recurrence", "cycle_template"):
                     if goal.get(field) is not None:
@@ -299,10 +310,17 @@ class Validator:
         fields = {"interval", "unit", "first_cycle_starts_on", "first_deadline"}
         if not self.object_fields(value, path, fields):
             return
-        self.integer(value.get("interval"), f"{path}.interval", 1)
-        self.enum(value.get("unit"), f"{path}.unit", {"week", "month"})
-        self.date(value.get("first_cycle_starts_on"), f"{path}.first_cycle_starts_on")
-        self.datetime(value.get("first_deadline"), f"{path}.first_deadline")
+        interval, unit = value.get("interval"), value.get("unit")
+        if (interval is None) != (unit is None):
+            self.error("incomplete_cadence", path, "interval and unit must both be known or both null")
+        if interval is not None:
+            self.integer(interval, f"{path}.interval", 1)
+        if unit is not None:
+            self.enum(unit, f"{path}.unit", {"week", "month"})
+        starts = self.date(value.get("first_cycle_starts_on"), f"{path}.first_cycle_starts_on", nullable=True)
+        deadline = self.datetime(value.get("first_deadline"), f"{path}.first_deadline", nullable=True)
+        if starts and deadline and self.timezone and deadline.astimezone(self.timezone).date() < starts:
+            self.error("invalid_cycle_deadline", path, "first deadline cannot precede the first cycle start")
 
     def validate_cycle_template(self, value: Any, path: str) -> None:
         if not self.object_fields(value, path, {"node", "todos"}):
@@ -315,6 +333,8 @@ class Validator:
         todos = value.get("todos")
         if not self.array(todos, f"{path}.todos"):
             return
+        if not todos:
+            self.error("empty_cycle_template", f"{path}.todos", "a reusable template needs at least one action; use null while unknown")
         keys: Dict[str, Dict[str, Any]] = {}
         graph: Dict[str, List[str]] = {}
         for index, todo in enumerate(todos):
@@ -391,7 +411,8 @@ class Validator:
         recurring_identities: Set[Tuple[str, str]] = set()
         for index, node in enumerate(nodes):
             path = f"$.task_structure.nodes[{index}]"
-            if not self.object_fields(node, path, NODE_FIELDS):
+            explicit = isinstance(node, dict) and bool(NODE_CYCLE_FIELDS.intersection(node))
+            if not self.object_fields(node, path, NODE_FIELDS | NODE_CYCLE_FIELDS if explicit else NODE_FIELDS):
                 continue
             node_id = node.get("id")
             self.unique_id(node_id, f"{path}.id", self.nodes, node)
@@ -407,15 +428,22 @@ class Validator:
             self.string(node.get("context"), f"{path}.context", nullable=True)
             self.timestamps(node, path)
             goal = self.goals.get(goal_id) if isinstance(goal_id, str) else None
-            if goal and goal.get("type") == "recurring":
-                if starts_on is None:
-                    self.error("recurring_node_fields", f"{path}.starts_on", "recurring nodes require starts_on")
-                if deadline is None:
-                    self.error("recurring_node_fields", f"{path}.deadline", "recurring nodes require a deadline")
-                if starts_on:
-                    identity = (goal_id, starts_on.isoformat())
+            kind, cycle_start = node_cycle_fields(node, goal or {})
+            self.enum(kind, f"{path}.kind", {"regular", "cycle"})
+            cycle_date = self.date(cycle_start, f"{path}.cycle_starts_on", nullable=True)
+            if goal and goal.get("type") == "habit":
+                self.error("invalid_node_goal", path, "habit goals cannot contain nodes")
+            if kind == "regular" and cycle_start is not None:
+                self.error("invalid_node_cycle", path, "regular nodes cannot have a cycle identity")
+            if kind == "cycle":
+                if goal and goal.get("type") != "recurring":
+                    self.error("invalid_node_goal", path, "cycle nodes require a recurring goal")
+                if not explicit and (starts_on is None or deadline is None):
+                    self.error("recurring_node_fields", path, "legacy recurring nodes require starts_on and deadline; use explicit fields for the new model")
+                if cycle_date:
+                    identity = (goal_id, cycle_date.isoformat())
                     if identity in recurring_identities:
-                        self.error("duplicate_recurring_node", path, "recurring node identity (goal_id, starts_on) is duplicated")
+                        self.error("duplicate_recurring_node", path, "recurring node identity (goal_id, cycle_starts_on) is duplicated")
                     recurring_identities.add(identity)
             dependencies = node.get("depends_on_node_ids")
             if self.array(dependencies, f"{path}.depends_on_node_ids") and isinstance(node_id, str):
@@ -1057,12 +1085,96 @@ class Validator:
             if not is_int(remaining):
                 continue
             if todo.get("execution_mode") == "single_block" and entries:
-                if len(entries) != 1 or duration_minutes(entries[0][0], entries[0][1]) != remaining:
-                    self.error("invalid_single_block_coverage", entries[0][3], "single_block future coverage must be one continuous entry equal to remaining work")
-            elif total > remaining:
+                if len(entries) != 1 or total < remaining:
+                    self.error("invalid_single_block_coverage", entries[0][3], "single_block future coverage must be one continuous entry covering all remaining work")
+            if total > remaining:
                 self.warning("future_coverage_exceeds_remaining", entries[0][3], f"future coverage is {total} minutes but remaining work is {remaining} minutes")
         self.validate_todo_dependencies(future_by_todo)
         self.validate_required_habit_spacing(future_by_todo)
+        self.validate_required_coverage(window_dates)
+
+    def active_todo_parents(self, todo: Dict[str, Any]) -> List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]]:
+        parents = []
+        refs = todo.get("parent_refs")
+        if not isinstance(refs, list):
+            return parents
+        for parent in refs:
+            if not isinstance(parent, dict):
+                continue
+            goal_id, node_id = parent.get("goal_id"), parent.get("node_id")
+            goal = self.goals.get(goal_id) if isinstance(goal_id, str) else None
+            node = self.nodes.get(node_id) if isinstance(node_id, str) else None
+            if goal and goal.get("status") == "active" and (
+                node_id is None or (node and node.get("goal_id") == goal_id and node.get("status") not in {"completed", "cancelled"})
+            ):
+                parents.append((goal, node))
+        return parents
+
+    def todo_deadlines(self, todo: Dict[str, Any]) -> List[Tuple[datetime, str]]:
+        deadlines = []
+        own = parse_datetime_value(todo.get("deadline"))
+        if own:
+            deadlines.append((own, "todo deadline"))
+        for goal, node in self.active_todo_parents(todo):
+            for obj, label in [(goal, "goal deadline"), (node, "node deadline")]:
+                value = parse_datetime_value(obj.get("deadline")) if obj else None
+                if value:
+                    deadlines.append((value, label))
+        return deadlines
+
+    def validate_required_coverage(self, window_dates: Optional[Tuple[date, date]]) -> None:
+        """Report candidate coverage gaps, without asserting real progress/readiness."""
+        if not window_dates or not self.timezone or not self.calculated_at:
+            return
+        horizon_end = datetime.combine(window_dates[1] + timedelta(days=1), time.min, self.timezone)
+        if self.calculated_at >= horizon_end:
+            return  # A stale week first needs progress review and week rollover.
+        by_todo: Dict[str, List[Tuple[datetime, datetime]]] = defaultdict(list)
+        for entry in self.schedule_entries:
+            todo_id = entry.get("todo_id")
+            if entry.get("source_type") == "todo" and isinstance(todo_id, str):
+                starts, ends = parse_datetime_value(entry.get("starts_at")), parse_datetime_value(entry.get("ends_at"))
+                if starts and ends and starts < ends:
+                    by_todo[todo_id].append((starts, ends))
+        for todo_id, todo in self.todos.items():
+            remaining = todo.get("remaining_estimate_minutes")
+            if todo.get("status") not in {"pending", "in_progress"} or not is_int(remaining) or remaining <= 0:
+                continue
+            if todo.get("parent_refs") and not self.active_todo_parents(todo):
+                continue
+            window = todo.get("execution_window")
+            if not isinstance(window, dict):
+                continue
+            window_start, window_end = parse_datetime_value(window.get("starts_at")), parse_datetime_value(window.get("ends_at"))
+            if not window_start or not window_end:
+                continue
+            boundaries = self.todo_deadlines(todo) + [(window_end, "execution_window end")]
+            boundary, reason = min(boundaries, key=lambda item: item[0])
+            if boundary > horizon_end:
+                continue  # Partial coverage of work due in a later week is allowed.
+            intervals = []
+            for starts, ends in by_todo.get(todo_id, []):
+                start = max(starts, self.calculated_at, window_start)
+                end = min(ends, boundary)
+                if start < end:
+                    intervals.append((start, end))
+            # Union intervals so overlapping duplicates cannot conceal a gap.
+            merged: List[Tuple[datetime, datetime]] = []
+            for start, end in sorted(intervals):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            covered = sum(duration_minutes(start, end) for start, end in merged)
+            if covered < remaining:
+                elapsed = "; boundary has already passed" if boundary <= self.calculated_at else ""
+                self.warning(
+                    "required_coverage_gap", f"$.task_structure.todos[{todo_id}]",
+                    f"{todo_id}: {remaining} minutes remaining, {covered} minutes scheduled before "
+                    f"{reason} {boundary.isoformat()}; missing {remaining - covered} minutes{elapsed}. "
+                    "Check actual progress and dependencies and the requested scheduling scope; "
+                    "this does not establish readiness or authorize unrelated rescheduling.",
+                )
 
     def validate_todo_entry(
         self,
@@ -1080,22 +1192,11 @@ class Validator:
                 self.error("todo_outside_execution_window", path, "starts before the todo execution_window")
             if window_end and ends > window_end:
                 self.error("todo_outside_execution_window", path, "ends after the todo execution_window")
-        deadlines: List[datetime] = []
-        own_deadline = parse_datetime_value(todo.get("deadline"))
-        if own_deadline:
-            deadlines.append(own_deadline)
-        for parent in todo.get("parent_refs", []):
-            if not isinstance(parent, dict):
-                continue
-            goal = self.goals.get(parent.get("goal_id"))
-            node = self.nodes.get(parent.get("node_id")) if parent.get("node_id") else None
-            if goal and goal.get("status") == "active" and (node is None or node.get("status") not in {"completed", "cancelled"}):
-                goal_deadline = parse_datetime_value(goal.get("deadline"))
-                node_deadline = parse_datetime_value(node.get("deadline")) if node else None
-                if goal_deadline:
-                    deadlines.append(goal_deadline)
-                if node_deadline:
-                    deadlines.append(node_deadline)
+        deadlines = [value for value, _ in self.todo_deadlines(todo)]
+        for _, node in self.active_todo_parents(todo):
+            node_start = parse_date_value(node.get("starts_on")) if node else None
+            if node_start and self.timezone and starts.astimezone(self.timezone).date() < node_start:
+                self.error("todo_before_node_start", path, "starts before an effective node's actual starts_on")
         if deadlines and ends > min(deadlines):
             self.error("todo_after_deadline", path, "ends after an effective todo, node, or goal deadline")
         if entry.get("availability_exception") is None:
@@ -1212,17 +1313,53 @@ class Validator:
             accumulated = 0
             completion_time: Optional[datetime] = None
             for starts, ends, _, _ in sorted(dependency_coverage.get(todo_id, []), key=lambda item: item[0]):
-                accumulated += duration_minutes(starts, ends)
+                # Remaining work is measured at calculated_at. Elapsed calendar
+                # time cannot supply coverage for work that is still remaining.
+                accumulated += duration_minutes(max(starts, self.calculated_at), ends)
                 if accumulated >= remaining:
                     completion_time = ends
                     break
             completion[todo_id] = completion_time
+        node_completion: Dict[str, Optional[datetime]] = {}
+
+        def expected_node_completion(node_id: str, visiting: Set[str]) -> Optional[datetime]:
+            if node_id in node_completion:
+                return node_completion[node_id]
+            node = self.nodes.get(node_id)
+            if not node or node_id in visiting or node.get("status") == "cancelled":
+                return None
+            if node.get("status") == "completed":
+                return self.calculated_at
+            children = [todo for todo in self.todos.values()
+                        if todo.get("status") != "cancelled" and any(
+                            isinstance(ref, dict) and ref.get("node_id") == node_id
+                            for ref in todo.get("parent_refs", []))]
+            # Listed actions already done cannot prove an unconfirmed outcome.
+            if not children or all(todo.get("status") == "completed" for todo in children):
+                node_completion[node_id] = None
+                return None
+            times = [completion.get(todo["id"]) for todo in children]
+            times.extend(expected_node_completion(dep, visiting | {node_id})
+                         for dep in node.get("depends_on_node_ids", []))
+            result = max(times) if times and all(t is not None for t in times) else None
+            node_completion[node_id] = result
+            return result
+
         for todo_id, entries in future_by_todo.items():
             todo = self.todos.get(todo_id)
             if not todo or not entries:
                 continue
             first_start = min(entry[0] for entry in entries)
             first_path = min(entries, key=lambda item: item[0])[3]
+            for _, node in self.active_todo_parents(todo):
+                for dependency in node.get("depends_on_node_ids", []) if node else []:
+                    expected = expected_node_completion(dependency, set())
+                    if expected is None:
+                        self.error("node_dependency_completion_unknown", first_path,
+                                   f"node predecessor {dependency} has no confirmed outcome or complete remaining-work coverage")
+                    elif first_start < expected:
+                        self.error("node_dependency_order", first_path,
+                                   f"starts before node predecessor {dependency} is planned to complete")
             for dependency in todo.get("depends_on_todo_ids", []):
                 predecessor = self.todos.get(dependency)
                 if not predecessor:

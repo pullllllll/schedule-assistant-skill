@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import subprocess
@@ -19,6 +20,13 @@ class PlanHandler(BaseHTTPRequestHandler):
     server: "PlanServer"
 
     def do_GET(self) -> None:
+        if self.path == "/" and self.server.page is not None:
+            body = self.server.page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path != "/plan.json":
             self.send_error(404)
             return
@@ -26,6 +34,9 @@ class PlanHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if self.server.identity:
+            self.send_header("X-Schedule-Viewer", "1")
+            self.send_header("X-Plan-Workspace", self.server.workspace_key)
         if self.server.fixture:
             self.send_header("X-Plan-Source", "fixture")
         self.end_headers()
@@ -72,11 +83,16 @@ class EnsureViewerTests(unittest.TestCase):
         )
 
     def start_server(
-        self, plan: dict[str, Any], *, fixture: bool = False
+        self, plan: dict[str, Any], *, fixture: bool = False, identity: bool = True,
+        page: str | None = '<meta name="schedule-assistant-viewer" content="1"><div id="app"></div><script type="module" src="/src/main.js"></script>',
+        workspace_key: str | None = None
     ) -> tuple[PlanServer, threading.Thread]:
         server = PlanServer(("127.0.0.1", 0), PlanHandler)
         server.plan = plan
         server.fixture = fixture
+        server.identity = identity
+        server.page = page
+        server.workspace_key = workspace_key or hashlib.sha256(str(self.workspace.resolve()).encode("utf-8")).hexdigest()
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         return server, thread
@@ -127,6 +143,37 @@ class EnsureViewerTests(unittest.TestCase):
         payload = json.loads(result.stderr)
         self.assertEqual(payload["status"], "port_conflict")
         self.assertEqual(payload["source"], "fixture")
+
+    def test_rejects_json_only_server(self) -> None:
+        self.assert_conflict({"identity": False, "page": None}, "not_viewer")
+
+    def test_rejects_viewer_with_missing_page(self) -> None:
+        self.assert_conflict({"page": None}, "viewer_page_unavailable")
+
+    def test_rejects_unrelated_html(self) -> None:
+        self.assert_conflict({"page": "<html>another app</html>"}, "viewer_page_invalid")
+
+    def test_rejects_page_without_app_bundle(self) -> None:
+        self.assert_conflict({"page": '<meta name="schedule-assistant-viewer" content="1"><div id="app"></div>'}, "viewer_page_invalid")
+
+    def test_rejects_same_plan_from_another_workspace(self) -> None:
+        self.assert_conflict({"workspace_key": "another-workspace"}, "different_workspace")
+
+    def test_rejects_different_plan(self) -> None:
+        plan = self.write_workspace()
+        server, thread = self.start_server({**plan, "extra": True})
+        self.addCleanup(self.stop_server, server, thread)
+        result = self.run_script("--check-only", "--port", str(server.server_port))
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(json.loads(result.stderr)["source"], "different_plan")
+
+    def assert_conflict(self, options: dict[str, Any], source: str) -> None:
+        plan = self.write_workspace()
+        server, thread = self.start_server(plan, **options)
+        self.addCleanup(self.stop_server, server, thread)
+        result = self.run_script("--check-only", "--port", str(server.server_port))
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stderr)["source"], source)
 
     def test_does_not_start_when_official_plan_is_missing(self) -> None:
         (self.workspace / "app").mkdir()

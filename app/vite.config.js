@@ -1,14 +1,19 @@
 import { readFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 
 // 正式计划在仓库根目录的 data/plan.json，不入库也不在应用目录内。
 // 中间件直读磁盘，保证 apply_plan.py 提交成功后刷新即最新。
 const PLAN_PATH = resolve(process.cwd(), "../data/plan.json");
 const FALLBACK_PATH = resolve(process.cwd(), "../fixtures/sample-plan.json");
+const WORKSPACE_KEY = createHash("sha256").update(realpathSync(resolve(process.cwd(), ".."))).digest("hex");
 
 function servePlan() {
   const handler = async (req, res, next) => {
-    if (!req.url?.startsWith("/plan.json")) return next();
+    if (req.url?.split("?")[0] !== "/plan.json") return next();
+    res.setHeader("X-Schedule-Viewer", "1");
+    res.setHeader("X-Plan-Workspace", WORKSPACE_KEY);
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
     try {

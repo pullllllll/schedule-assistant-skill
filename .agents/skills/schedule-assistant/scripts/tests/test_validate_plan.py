@@ -286,7 +286,7 @@ class ValidatePlanTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("dependency_completion_unknown", self.codes(result))
 
-    def test_in_progress_full_block_can_supply_dependency_completion_time(self) -> None:
+    def test_in_progress_elapsed_time_cannot_supply_dependency_completion(self) -> None:
         plan = scheduled_plan()
         predecessor_entry = plan["schedule"]["entries"][0]
         predecessor_entry["starts_at"] = "2026-08-18T07:30:00+08:00"
@@ -301,7 +301,35 @@ class ValidatePlanTests(unittest.TestCase):
 
         code, result = self.validate(plan, {"2026-08-18": "workday"})
 
+        self.assertEqual(code, 1, result)
+        self.assertIn("dependency_completion_unknown", self.codes(result))
+
+    def test_in_progress_future_portion_and_resumption_cover_remaining_work(self) -> None:
+        plan = scheduled_plan()
+        plan["availability_rules"]["workday"]["segments"][0]["starts_time"] = "08:00"
+        plan["task_structure"]["todos"][0]["status"] = "in_progress"
+        entry = plan["schedule"]["entries"][0]
+        entry.update(starts_at="2026-08-18T07:30:00+08:00", ends_at="2026-08-18T08:30:00+08:00")
+        resumed = todo_entry("entry-resumed", "todo-a", 2)
+        resumed.update(starts_at="2026-08-18T09:00:00+08:00", ends_at="2026-08-18T09:30:00+08:00")
+        dependent = base_todo("todo-b")
+        dependent["depends_on_todo_ids"] = ["todo-a"]
+        dependent_entry = todo_entry("entry-b", "todo-b", 3)
+        dependent_entry.update(starts_at="2026-08-18T09:30:00+08:00", ends_at="2026-08-18T10:30:00+08:00")
+        plan["task_structure"]["todos"].append(dependent)
+        plan["schedule"]["entries"].extend([resumed, dependent_entry])
+
+        code, result = self.validate(plan, {"2026-08-18": "workday"})
+
         self.assertEqual(code, 0, result)
+
+        # A gap before resumption is free on the calendar, but the predecessor
+        # still has 30 minutes left. Its earlier elapsed time is not coverage.
+        dependent_entry.update(starts_at="2026-08-18T08:30:00+08:00", ends_at="2026-08-18T08:45:00+08:00")
+        dependent["remaining_estimate_minutes"] = 15
+        code, result = self.validate(plan, {"2026-08-18": "workday"})
+        self.assertEqual(code, 1, result)
+        self.assertEqual(self.codes(result), {"dependency_order"})
 
     def test_rejects_non_rfc3339_datetime_even_if_python_can_parse_it(self) -> None:
         plan = empty_plan()

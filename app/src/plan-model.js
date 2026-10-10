@@ -60,6 +60,32 @@ function shiftDate(iso, days) {
   return d.toISOString().slice(0, 10);
 }
 
+// 半开区间：前一条结束时开始的条目不算重叠。每组复用空闲列。
+export function layoutDayEntries(entries) {
+  const result = [];
+  let group = [], laneEnds = [], groupEnd = -Infinity;
+  const flush = () => {
+    result.push(...group.map(entry => ({ ...entry, laneCount: laneEnds.length })));
+    group = []; laneEnds = [];
+  };
+  for (const entry of [...entries].sort((a, b) => a.startMinutes - b.startMinutes || b.endMinutes - a.endMinutes || a.id.localeCompare(b.id))) {
+    if (entry.startMinutes >= groupEnd) flush();
+    let lane = laneEnds.findIndex(end => end <= entry.startMinutes);
+    if (lane < 0) lane = laneEnds.length;
+    laneEnds[lane] = entry.endMinutes;
+    groupEnd = group.length ? Math.max(groupEnd, entry.endMinutes) : entry.endMinutes;
+    group.push({ ...entry, lane });
+  }
+  flush();
+  return result;
+}
+
+// 保留真实比例；有短条目时放大整周刻度。上限之外的极短条目用标记和详情呈现。
+export function weekSlotHeight(entries) {
+  const shortest = Math.min(30, ...entries.map(e => e.durationMinutes).filter(n => n > 0));
+  return Math.max(30, Math.min(180, 30 * 28 / shortest));
+}
+
 // 有效归属路径：只算 active Goal 与未完成/未取消的 Node（DS-008，2026-08-14）
 function effectiveParents(todo, goals, nodes) {
   return (todo.parent_refs || []).flatMap(ref => {
@@ -121,9 +147,79 @@ export function buildGraph(model, scope, focusGoalId) {
   return { nodes: placed, edges, height, counts: { goals: goals.length, nodes: nodes.length, todos: todos.length } };
 }
 
+export function habitPeriodLabel(startsOn, rule) {
+  if (!startsOn) return "未分期";
+  const short = date => date.slice(5).replace("-", "/");
+  if (!rule || !Number.isInteger(rule.interval) || rule.interval < 1) return short(startsOn);
+  let nextStart;
+  if (rule.unit === "day" || rule.unit === "week") {
+    nextStart = shiftDate(startsOn, rule.interval * (rule.unit === "week" ? 7 : 1));
+  } else if (rule.unit === "month" && rule.first_period_starts_on) {
+    const [year, month] = startsOn.split("-").map(Number);
+    const anchorDay = Number(rule.first_period_starts_on.slice(8, 10));
+    // 短月压到月末后，下期仍使用原始锚点，不能从 2/28 永久漂移到每月 28 日。
+    const next = new Date(Date.UTC(year, month - 1 + rule.interval, 1));
+    const lastDay = new Date(Date.UTC(next.getUTCFullYear(), next.getUTCMonth() + 1, 0)).getUTCDate();
+    next.setUTCDate(Math.min(anchorDay, lastDay));
+    nextStart = next.toISOString().slice(0, 10);
+  } else return short(startsOn);
+  const endsOn = shiftDate(nextStart, -1);
+  if (endsOn === startsOn) return short(startsOn);
+  const label = startsOn.slice(0, 4) === endsOn.slice(0, 4)
+    ? short : date => date.replaceAll("-", "/");
+  return `${label(startsOn)} – ${label(endsOn)}`;
+}
+
+// 每日习惯按自然周收纳展示；原始日周期和完成要求保持不变。
+export function habitDisplayGroups(goal, todos) {
+  const byWeek = goal.habit_rule?.unit === "day" && goal.habit_rule.interval === 1;
+  const groups = new Map();
+  for (const todo of todos) {
+    const ref = todo.parent_refs.find(item => item.goal_id === goal.id && item.node_id == null);
+    if (!ref) continue;
+    const date = ref.habit_period_starts_on;
+    const startsOn = date && byWeek
+      ? shiftDate(date, -((new Date(`${date}T00:00:00Z`).getUTCDay() + 6) % 7)) : date;
+    const key = startsOn || "none";
+    if (!groups.has(key)) groups.set(key, {
+      id: `${goal.id}-${byWeek ? "week-" : ""}${key}`,
+      title: startsOn ? habitPeriodLabel(startsOn, byWeek ? { unit: "week", interval: 1 } : goal.habit_rule) : "当前周期",
+      displayKind: byWeek ? "week" : "period",
+      todos: [],
+    });
+    groups.get(key).todos.push(todo);
+  }
+  return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, group]) => {
+    group.todos.sort((a, b) => {
+      const refA = a.parent_refs.find(ref => ref.goal_id === goal.id);
+      const refB = b.parent_refs.find(ref => ref.goal_id === goal.id);
+      return String(refA.habit_period_starts_on || "").localeCompare(String(refB.habit_period_starts_on || ""))
+        || (refA.habit_occurrence_index || 0) - (refB.habit_occurrence_index || 0)
+        || a.id.localeCompare(b.id);
+    });
+    return group;
+  });
+}
+
+export function recurringDetails(goal) {
+  const rule = goal.recurrence;
+  const unit = { week: "周", month: "个月" }[rule?.unit];
+  return [
+    ["循环规则", rule?.interval && unit ? `每 ${rule.interval} ${unit}` : "周期待定"],
+    ["首个周期", rule?.first_cycle_starts_on || "起始日期待定"],
+    ["每期流程", goal.cycle_template ? "已设定模板" : "模板待定"],
+  ];
+}
+
 export function buildModel(plan, now = new Date()) {
   const timezone = plan.plan_meta.timezone;
-  const structure = plan.task_structure;
+  const raw = plan.task_structure;
+  // Legacy interpretation is read-only; explicit null anchors remain unbound.
+  const structure = { ...raw, nodes: raw.nodes.map(node => {
+    if ("kind" in node || "cycle_starts_on" in node) return node;
+    const recurring = raw.goals.some(g => g.id === node.goal_id && g.type === "recurring");
+    return { ...node, kind: recurring ? "cycle" : "regular", cycle_starts_on: recurring ? node.starts_on : null };
+  }) };
   const goals = new Map(structure.goals.map(g => [g.id, g]));
   const nodes = new Map(structure.nodes.map(n => [n.id, n]));
   const todos = new Map(structure.todos.map(t => [t.id, t]));
@@ -136,6 +232,11 @@ export function buildModel(plan, now = new Date()) {
     if (todo.status === "cancelled") return "已取消";
     const blocked = (todo.depends_on_todo_ids || []).some(id => todos.get(id)?.status !== "completed");
     if (blocked) return "等待前置行动";
+    const parents = effectiveParents(todo, goals, nodes);
+    if (parents.some(({ node }) => (node?.depends_on_node_ids || []).some(id => nodes.get(id)?.status !== "completed"))) {
+      return "等待前置成果";
+    }
+    if (parents.some(({ node }) => node?.starts_on && node.starts_on > current.date)) return "未到可开始日期";
     if (local.date > current.date || (local.date === current.date && local.minutes > current.minutes)) return "未到安排时间";
     if (local.date < current.date || (local.date === current.date && localEnd.minutes <= current.minutes)) return "待核对进度";
     return todo.status === "in_progress" ? "正在进行" : "现在可行动";
@@ -152,6 +253,10 @@ export function buildModel(plan, now = new Date()) {
       id: entry.id,
       sourceType: entry.source_type,
       date: local.date,
+      endDate: localEnd.date,
+      localEndMinutes: localEnd.minutes,
+      fullTimeLabel: `${local.date} ${clock(local.minutes)}–${localEnd.date === local.date ? "" : localEnd.date + " "}${clock(localEnd.minutes)}`,
+      totalDurationMinutes: (end - start) / 60000,
       startMinutes: local.minutes,
       endMinutes,
       startLabel: clock(local.minutes),
@@ -214,8 +319,15 @@ export function buildModel(plan, now = new Date()) {
   const entries = plan.schedule.entries.map(resolve);
   const byDate = new Map();
   for (const entry of entries) {
-    if (!byDate.has(entry.date)) byDate.set(entry.date, []);
-    byDate.get(entry.date).push(entry);
+    for (let date = entry.date; date <= entry.endDate; date = shiftDate(date, 1)) {
+      const startMinutes = date === entry.date ? entry.startMinutes : 0;
+      const endMinutes = date === entry.endDate ? entry.localEndMinutes : 1440;
+      if (endMinutes <= startMinutes) continue;
+      const slice = { ...entry, date, startMinutes, endMinutes,
+        startLabel: clock(startMinutes), endLabel: clock(endMinutes), durationMinutes: endMinutes - startMinutes };
+      if (!byDate.has(date)) byDate.set(date, []);
+      byDate.get(date).push(slice);
+    }
   }
   for (const list of byDate.values()) list.sort((a, b) => a.startMinutes - b.startMinutes);
 

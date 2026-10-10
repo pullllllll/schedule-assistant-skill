@@ -1,5 +1,5 @@
 import "./styles.css";
-import { buildModel } from "./plan-model.js";
+import { buildModel, habitDisplayGroups, layoutDayEntries, recurringDetails, weekSlotHeight } from "./plan-model.js";
 
 const PLAN_URL = "/plan.json";
 const POLL_MS = 5000;
@@ -186,7 +186,7 @@ function dayView() {
         <time>${entry.startLabel}<small>${entry.endLabel}</small></time>
         <span class="timeline-node" aria-hidden="true">${entry.shared ? goalBars(entry.goalRefs) : ""}${icon(scheduleTypeIcon(entry))}</span>
         <span class="timeline-copy">
-          <small class="timeline-meta">${esc(scheduleEntryLabel(entry))}${entry.priority ? " · " + entry.priority : ""}${entry.shared ? " · 共享" + extraGoals : ""}</small>
+          <small class="timeline-meta">${entry.status === "completed" ? '<span class="completion-label">✓ 已完成</span> · ' : ""}${esc(scheduleEntryLabel(entry))}${entry.priority ? " · " + entry.priority : ""}${entry.shared ? " · 共享" + extraGoals : ""}</small>
           <strong>${esc(entry.title)}</strong>
           ${model.parentLabel(entry) ? `<span class="timeline-parent">${esc(model.parentLabel(entry))}</span>` : ""}
           <small class="timeline-duration">${entry.startLabel}–${entry.endLabel} · ${entry.durationMinutes} 分钟</small>
@@ -216,19 +216,21 @@ function weekView() {
   const total = days.reduce((n, d) => n + d.entries.length, 0);
   const todayIndex = days.findIndex(d => d.date === model.today);
   const highlightTitle = state.highlightGoal ? model.goalById.get(state.highlightGoal)?.title : null;
-  const cards = days.flatMap((day, i) => day.entries.map(entry => {
+  const slotHeight = weekSlotHeight(days.flatMap(day => day.entries));
+  const cards = days.flatMap((day, i) => layoutDayEntries(day.entries).map(entry => {
     const dim = highlightTitle && !entry.parents?.some(p => p.goalTitle === highlightTitle);
     const slot = Math.max(0, model.slotOf(entry.startMinutes));
-    const span = Math.max(1, Math.round(entry.durationMinutes / 30));
+    const span = entry.durationMinutes / 30;
     const kindClass = entry.entryKind !== "action" ? `card-${entry.entryKind}`
       : entry.shared ? "card-shared" : entry.primaryColorKey ? "card-action" : "card-standalone";
-    const densityClass = span <= 1 ? "is-compact" : span === 2 ? "is-standard" : "is-roomy";
+    const densityClass = span * slotHeight < 28 ? "is-marker" : span <= 1 ? "is-compact" : span <= 2 ? "is-standard" : "is-roomy";
     const typeIcon = scheduleTypeIcon(entry);
+    const label = `${entry.startLabel}–${entry.endLabel} ${entry.title} ${scheduleEntryLabel(entry)}${entry.status === "completed" ? " · 已完成" : ""}`;
     const parentLabel = model.parentLabel(entry);
     return `<button class="schedule-card ${kindClass} ${densityClass} ${isSelected("entry", entry.id) ? "is-selected" : ""} ${dim ? "is-dimmed" : ""}"
-        data-entry="${entry.id}" aria-label="${esc(`${entry.startLabel} ${entry.title} ${scheduleEntryLabel(entry)}`)}" style="--day:${i + 1};--start:${slot};--span:${span};${entryToneVars(entry)}">
+        data-entry="${entry.id}" aria-label="${esc(label)}" title="${esc(label)}" style="--day:${i + 1};--lane:${entry.lane};--lanes:${entry.laneCount};--start:${slot};--span:${span};${entryToneVars(entry)}">
         ${entry.shared ? goalBars(entry.goalRefs) : ""}
-        <span class="card-head"><i class="card-kind-icon" aria-hidden="true">${icon(typeIcon)}</i><span class="card-time">${entry.startLabel}</span></span>
+        <span class="card-head"><i class="card-kind-icon" aria-hidden="true">${entry.status === "completed" ? '<span class="completion-label">✓</span>' : icon(typeIcon)}</i><span class="card-time">${entry.startLabel}</span></span>
         <strong>${esc(entry.title)}</strong>
         ${parentLabel ? `<small>${esc(parentLabel)}</small>` : ""}
       </button>`;
@@ -237,7 +239,7 @@ function weekView() {
     <section class="main-view week-view" aria-label="周日程">
       ${highlightTitle ? `<div class="filter-bar">正在高亮「${esc(highlightTitle)}」的时间块 <button data-locate="clear">显示全部</button></div>` : ""}
       <div class="calendar-scroll">
-        <div class="week-calendar" style="--slots:${model.grid.slots}">
+        <div class="week-calendar" style="--slots:${model.grid.slots};--slot-h:${slotHeight}px">
           <div class="corner">${esc(model.timezone.split("/")[1] || model.timezone)}</div>
           ${days.map(d => `<div class="day-head ${d.date === model.today ? "is-today" : ""}"><span>周${d.weekdayLabel}</span><strong>${d.dayNumber}</strong></div>`).join("")}
           ${model.hourLabels.map((h, i) => `<div class="hour ${i === model.hourLabels.length - 1 ? "is-edge" : ""}" style="--slot:${h.slot}">${h.label}</div>`).join("")}
@@ -279,11 +281,6 @@ const byDDL = (a, b) => ddlTime(a) - ddlTime(b) || String(a.created_at || "").lo
 const shortDate = value => value ? new Intl.DateTimeFormat("zh-CN", {
   timeZone: model.timezone, month: "numeric", day: "numeric",
 }).format(new Date(value)) : "未设 DDL";
-const periodLabel = startsOn => {
-  if (!startsOn) return "未分期";
-  const week = model.weekOf(startsOn);
-  return `${week.starts_on.slice(5).replace("-", "/")} – ${week.ends_on.slice(5).replace("-", "/")}`;
-};
 
 function cleanCircle(object, kind, { meta = "", expandable = false, visualOnly = false } = {}) {
   const done = object.status === "completed";
@@ -293,7 +290,7 @@ function cleanCircle(object, kind, { meta = "", expandable = false, visualOnly =
   const identity = kind === "goal"
     ? `${icon(object.type === "habit" ? "sprout" : object.type === "recurring" ? "refresh" : "route")}<span>${esc(TYPE_LABEL[object.type] || "目标")}</span>`
     : kind === "node"
-      ? "<span>节点</span>"
+      ? `<span>${object.kind === "cycle" ? "每期节点" : "成果节点"}</span>`
       : kind === "period"
         ? "<span>习惯周期</span>"
         : shared
@@ -332,18 +329,11 @@ function cleanTreeData(goal) {
   const directTodos = model.todos.filter(todo => todo.parent_refs.some(ref => ref.goal_id === goal.id && ref.node_id == null));
   const rows = [];
   if (goal.type === "habit") {
-    const periods = new Map();
-    for (const todo of directTodos) {
-      const ref = todo.parent_refs.find(item => item.goal_id === goal.id);
-      const key = ref?.habit_period_starts_on || "none";
-      if (!periods.has(key)) periods.set(key, []);
-      periods.get(key).push(todo);
-    }
-    for (const [startsOn, todos] of [...periods.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    for (const group of habitDisplayGroups(goal, directTodos)) {
       rows.push({
         kind: "period",
-        object: { id: `${goal.id}-${startsOn}`, title: startsOn === "none" ? "当前周期" : periodLabel(startsOn), status: "pending" },
-        todos: todos.sort(byDDL),
+        object: { id: group.id, title: group.title, status: "pending" },
+        todos: group.todos,
       });
     }
   } else {
@@ -542,7 +532,7 @@ function drawerBody() {
       actions: e.sourceType === "todo" ? [["relations:" + e.entityId, "在任务中查看"]] : [],
       rows: [
         ["类别", e.kindLabel],
-        ["时间", `${e.date} ${e.startLabel}–${e.endLabel} · ${e.durationMinutes} 分钟`],
+        ["时间", `${e.fullTimeLabel} · ${e.totalDurationMinutes} 分钟`],
         e.priority ? ["优先级", `${e.priority}（取有效所属目标中最高）`] : null,
         e.parents?.length ? ["所属结构", e.parents.map(p => `${esc(p.goalTitle)}${p.nodeTitle ? " › " + esc(p.nodeTitle) : ""}`).join("<br/>")] : null,
         e.remainingMinutes != null ? ["剩余工作量", `${e.remainingMinutes} 分钟`] : null,
@@ -556,16 +546,18 @@ function drawerBody() {
   const o = found.object;
   if (found.kind === "goal") {
     return { kicker: "目标", title: o.title, status: o.status, actions: [["goal:" + o.id, "高亮它的时间块"]], rows: [
-      ["类型", TYPE_LABEL[o.type]], ["目标优先级", o.priority], ["完成结果", esc(o.outcome)],
+      ["类型", TYPE_LABEL[o.type]], ["目标优先级", o.priority], [o.type === "habit" ? "期望结果" : "完成结果", esc(o.outcome)],
       o.deadline ? ["DDL", new Date(o.deadline).toLocaleString("zh-CN", { timeZone: model.timezone })] : null,
-      o.habit_rule ? ["习惯规则", `每 ${o.habit_rule.interval} ${o.habit_rule.unit} 至少 ${o.habit_rule.minimum_count} 次 · 每次 ${o.habit_rule.session_minutes} 分钟`] : null,
-      o.recurrence ? ["循环规则", `每 ${o.recurrence.interval} ${o.recurrence.unit}`] : null,
+      o.habit_rule ? ["执行规则", `每 ${o.habit_rule.interval} ${{ day: "天", week: "周", month: "个月" }[o.habit_rule.unit]} 至少 ${o.habit_rule.minimum_count} 次 · 每次 ${o.habit_rule.session_minutes} 分钟`] : null,
+      ...(o.type === "recurring" ? recurringDetails(o).map(([label, value]) => [label, esc(value)]) : []),
       o.context ? ["背景", esc(o.context)] : null,
     ].filter(Boolean) };
   }
   if (found.kind === "node") {
-    return { kicker: "节点", title: o.title, status: o.status, rows: [
+    return { kicker: o.kind === "cycle" ? "每期节点" : "成果节点", title: o.title, status: o.status, rows: [
       ["所属目标", esc(model.goalById.get(o.goal_id)?.title ?? o.goal_id)], ["完成结果", esc(o.outcome)],
+      o.kind === "cycle" ? ["所属周期", esc(o.cycle_starts_on || "尚未绑定周期")] : null,
+      o.starts_on ? ["可开始日期", esc(o.starts_on)] : null,
       o.deadline ? ["DDL", new Date(o.deadline).toLocaleString("zh-CN", { timeZone: model.timezone })] : null,
       o.depends_on_node_ids.length ? ["前置节点", o.depends_on_node_ids.map(id => esc(model.nodeById.get(id)?.title ?? id)).join("<br/>")] : null,
     ].filter(Boolean) };
@@ -580,7 +572,7 @@ function drawerBody() {
       parents.length ? ["所属结构", parents.map(p => `${esc(p.goalTitle)}${p.nodeTitle ? " › " + esc(p.nodeTitle) : ""}`).join("<br/>")] : ["所属", "独立行动"],
       o.deadline ? ["DDL", new Date(o.deadline).toLocaleString("zh-CN", { timeZone: model.timezone })] : null,
       o.depends_on_todo_ids.length ? ["前置行动", o.depends_on_todo_ids.map(id => esc(model.todoById.get(id)?.title ?? id)).join("<br/>")] : null,
-      ["已排期", scheduled.length ? scheduled.map(e => `${e.date} ${e.startLabel}–${e.endLabel}`).join("<br/>") : "尚未排期"],
+      ["已排期", scheduled.length ? scheduled.map(e => e.fullTimeLabel).join("<br/>") : "尚未排期"],
       o.context ? ["背景", esc(o.context)] : null,
     ].filter(Boolean) };
 }

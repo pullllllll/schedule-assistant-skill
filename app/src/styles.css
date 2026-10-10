@@ -165,8 +165,13 @@ button:focus-visible { outline: 2px solid color-mix(in oklch, var(--accent-focus
   background: repeating-linear-gradient(90deg, transparent 0, transparent calc(14.2857% - 1px),
     color-mix(in oklch, var(--line) 52%, transparent) calc(14.2857% - 1px), color-mix(in oklch, var(--line) 52%, transparent) 14.2857%); }
 
-.schedule-card { position: relative; grid-column: calc(var(--day) + 1); grid-row: calc(var(--start) + 2) / span var(--span);
-  margin: 2px 5px; padding: 5px 7px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+.schedule-card { position: absolute;
+  left: calc(var(--time-col) + (var(--day) - 1) * ((100% - var(--time-col)) / 7) + 5px + var(--lane, 0) * (((100% - var(--time-col)) / 7 - 10px) / var(--lanes, 1)));
+  width: calc(((100% - var(--time-col)) / 7 - 10px) / var(--lanes, 1) - 2px);
+  top: calc(40px + var(--start) * ((100% - 40px) / var(--slots, 16)) + 2px);
+  height: max(1px, calc(var(--span) * ((100% - 40px) / var(--slots, 16)) - 4px));
+  min-height: 0; min-width: 0; box-sizing: border-box;
+  margin: 0; padding: 5px 7px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
   border: 1px solid color-mix(in oklch, var(--line) 72%, transparent); border-left: 3px solid var(--tone, var(--line)); border-radius: 7px;
   background: var(--tone-soft, var(--surface)); color: var(--ink);
   text-align: left; cursor: pointer; overflow: hidden; z-index: 4; }
@@ -186,7 +191,10 @@ button:focus-visible { outline: 2px solid color-mix(in oklch, var(--accent-focus
 .schedule-card.is-compact { flex-direction: row; align-items: center; gap: 5px; padding-block: 2px; }
 .schedule-card.is-compact .card-head { flex: none; }
 .schedule-card.is-compact .card-time, .schedule-card.is-compact small { display: none; }
-.schedule-card.is-compact strong { -webkit-line-clamp: 1; white-space: nowrap; }
+.schedule-card.is-compact strong { display: block; flex: 1; min-width: 0; white-space: nowrap; text-overflow: ellipsis; }
+.completion-label { font-weight: 700; }
+.schedule-card.is-marker { padding: 0; }
+.schedule-card.is-marker > * { display: none; }
 /* 独立行动与固定安排：A 卡片骨架，白底深色侧轨，由 unlink / pin 图标区分。 */
 .card-standalone, .card-fixed { border-left-color: var(--goal-neutral-stroke); background: var(--surface); }
 /* 共享行动：中性底 + 左侧多段 Goal 色条（最多两段，其余 +n） */

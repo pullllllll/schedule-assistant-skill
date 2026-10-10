@@ -121,6 +121,8 @@ class ApplyPlanTests(unittest.TestCase):
                 if lock_file:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
                     lock_file.close()
+            if result.returncode != 0:
+                self.assertEqual(official_path.read_bytes(), original_bytes)
             applied = json.loads(official_path.read_text(encoding="utf-8"))
             candidate_after = json.loads(candidate_path.read_text(encoding="utf-8"))
             return result, applied, original_bytes, candidate_after
@@ -388,6 +390,184 @@ class ApplyPlanTests(unittest.TestCase):
             "progress_checkpoint_rollback",
             {item["code"] for item in json.loads(result.stdout)["errors"]},
         )
+        self.assertEqual(applied, official)
+
+    def history_plan(self, past: bool = False) -> dict:
+        plan = empty_plan()
+        plan["plan_meta"]["progress_reviewed_through"] = "2026-08-18T07:00:00+08:00"
+        task = todo()
+        task["execution_window"]["starts_at"] = "2026-08-17T00:00:00+08:00"
+        other = copy.deepcopy(task)
+        other["id"] = "todo-b"
+        plan["task_structure"]["todos"] = [task, other]
+        plan["availability_rules"]["calendar_id"] = "CN"
+        plan["availability_rules"]["workday"]["segments"] = [
+            {"starts_time": "00:00", "ends_time": "23:59", "energy_level": "medium"}
+        ]
+        day = "2026-08-17" if past else "2026-08-18"
+        plan["schedule"] = {
+            "planning_window": {"starts_on": "2026-08-17", "ends_on": "2026-08-23"},
+            "generated_at": "2026-08-18T07:00:00+08:00",
+            "entries": [{"id": "entry-a", "source_type": "todo", "todo_id": "todo-a",
+                         "starts_at": day + "T14:00:00+08:00", "ends_at": day + "T15:00:00+08:00",
+                         "daily_rank": 1, "priority_reason": None,
+                         "ranking_exception": None, "availability_exception": None}],
+        }
+        return plan
+
+    def apply_history_candidate(self, candidate: dict, official: dict):
+        candidate["schedule"]["generated_at"] = COMMITTED_AT
+        return self.run_apply(candidate, official, classifications={
+            "2026-08-17": "workday", "2026-08-18": "workday",
+        })
+
+    def test_reviewed_history_rejects_new_moved_and_reassigned_entries(self) -> None:
+        for operation in ("new", "move", "retime", "rename", "reassign", "at_checkpoint"):
+            with self.subTest(operation=operation):
+                official = self.history_plan(past=operation in {"retime", "rename", "reassign"})
+                candidate = copy.deepcopy(official)
+                entry = candidate["schedule"]["entries"][0]
+                if operation == "new":
+                    entry = copy.deepcopy(entry)
+                    entry["id"] = "new-history"
+                    candidate["schedule"]["entries"].append(entry)
+                if operation in {"new", "move", "retime"}:
+                    entry.update(starts_at="2026-08-17T16:00:00+08:00", ends_at="2026-08-17T17:00:00+08:00")
+                elif operation == "rename":
+                    entry["id"] = "replacement-history"
+                elif operation == "reassign":
+                    entry["todo_id"] = "todo-b"
+                elif operation == "at_checkpoint":
+                    entry.update(starts_at="2026-08-18T06:00:00+08:00", ends_at="2026-08-18T07:00:00+08:00")
+                result, applied, _, _ = self.apply_history_candidate(candidate, official)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("reviewed_history_changed", {e["code"] for e in json.loads(result.stdout)["errors"]})
+                self.assertEqual(applied, official)
+
+    def test_unstarted_reviewed_entry_can_move_to_future_with_same_identity(self) -> None:
+        official = self.history_plan(past=True)
+        candidate = copy.deepcopy(official)
+        candidate["schedule"]["entries"][0].update(
+            starts_at="2026-08-18T14:00:00+08:00", ends_at="2026-08-18T15:00:00+08:00")
+        result, applied, _, _ = self.apply_history_candidate(candidate, official)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(applied["task_structure"], official["task_structure"])
+        self.assertEqual(applied["schedule"]["entries"][0]["id"], "entry-a")
+        self.assertEqual(applied["plan_meta"]["progress_reviewed_through"], official["plan_meta"]["progress_reviewed_through"])
+
+    def test_preserved_history_allows_ranking_and_equivalent_timezone_notation(self) -> None:
+        official = self.history_plan(past=True)
+        candidate = copy.deepcopy(official)
+        candidate["schedule"]["entries"][0].update(
+            starts_at="2026-08-17T06:00:00Z", ends_at="2026-08-17T07:00:00Z",
+            priority_reason="更新关注原因，保留原历史时刻")
+        result, _, _, _ = self.apply_history_candidate(candidate, official)
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_history_guard_uses_old_checkpoint_when_review_advances(self) -> None:
+        official = self.history_plan()
+        candidate = copy.deepcopy(official)
+        candidate["plan_meta"]["progress_reviewed_through"] = COMMITTED_AT
+        candidate["schedule"]["entries"][0].update(
+            starts_at="2026-08-18T07:00:00+08:00", ends_at="2026-08-18T07:45:00+08:00")
+        result, _, _, _ = self.apply_history_candidate(candidate, official)
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_invalid_history_time_is_rejected_by_full_validator(self) -> None:
+        official = self.history_plan(past=True)
+        candidate = copy.deepcopy(official)
+        candidate["schedule"]["entries"][0]["ends_at"] = "not-a-time"
+        result, applied, _, _ = self.apply_history_candidate(candidate, official)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["error"], "validation_failed")
+        self.assertEqual(applied, official)
+
+    def unreviewed_history_plan(self) -> dict:
+        plan = self.history_plan(past=True)
+        plan["plan_meta"]["progress_reviewed_through"] = "2026-08-17T13:00:00+08:00"
+        return plan
+
+    def test_unreviewed_ended_entry_cannot_disappear_or_change_owner(self) -> None:
+        for operation in ("delete", "rename", "reassign", "completed_todo", "null_checkpoint"):
+            with self.subTest(operation=operation):
+                official = self.unreviewed_history_plan()
+                if operation == "null_checkpoint":
+                    official["plan_meta"]["progress_reviewed_through"] = None
+                candidate = copy.deepcopy(official)
+                entry = candidate["schedule"]["entries"][0]
+                if operation == "rename":
+                    entry["id"] = "replacement-id"
+                elif operation == "reassign":
+                    entry["todo_id"] = "todo-b"
+                else:
+                    candidate["schedule"]["entries"] = []
+                if operation == "completed_todo":
+                    candidate["task_structure"]["todos"][0].update(
+                        status="completed", remaining_estimate_minutes=0, updated_at=COMMITTED_AT)
+                result, applied, _, _ = self.apply_history_candidate(candidate, official)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("unreviewed_history_removed", {e["code"] for e in json.loads(result.stdout)["errors"]})
+                self.assertEqual(applied, official)
+
+    def test_history_removal_uses_candidate_checkpoint_at_entry_end(self) -> None:
+        for checkpoint, allowed in (("2026-08-03T14:59:59+08:00", False),
+                                    ("2026-08-03T07:00:00Z", True)):
+            with self.subTest(checkpoint=checkpoint):
+                official = self.unreviewed_history_plan()
+                official["plan_meta"]["progress_reviewed_through"] = "2026-08-03T13:00:00+08:00"
+                official["schedule"]["entries"][0].update(
+                    starts_at="2026-08-03T14:00:00+08:00", ends_at="2026-08-03T15:00:00+08:00")
+                candidate = copy.deepcopy(official)
+                candidate["plan_meta"]["progress_reviewed_through"] = checkpoint
+                candidate["schedule"]["entries"] = []
+                result, applied, _, _ = self.apply_history_candidate(candidate, official)
+                self.assertEqual(result.returncode, 0 if allowed else 1, result.stdout)
+                if allowed:
+                    self.assertEqual(applied["schedule"]["entries"], [])
+                else:
+                    self.assertIn("unreviewed_history_removed", {e["code"] for e in json.loads(result.stdout)["errors"]})
+                    self.assertEqual(applied, official)
+
+    def test_deletion_guard_does_not_block_local_updates_or_original_entry_move(self) -> None:
+        for move in (False, True):
+            with self.subTest(move=move):
+                official = self.unreviewed_history_plan()
+                candidate = copy.deepcopy(official)
+                if move:
+                    candidate["schedule"]["entries"][0].update(
+                        starts_at="2026-08-18T14:00:00+08:00", ends_at="2026-08-18T15:00:00+08:00")
+                else:
+                    candidate["task_structure"]["todos"][1].update(title="更新无关任务标题", updated_at=COMMITTED_AT)
+                result, applied, _, _ = self.apply_history_candidate(candidate, official)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(applied["schedule"]["entries"][0]["id"], "entry-a")
+                self.assertEqual(applied["plan_meta"]["progress_reviewed_through"], official["plan_meta"]["progress_reviewed_through"])
+
+    def test_deletion_guard_includes_entry_ending_at_commit_but_not_future(self) -> None:
+        for starts_at, ends_at, allowed in (("2026-08-18T07:30:00+08:00", COMMITTED_AT, False),
+                                           ("2026-08-18T09:00:00+08:00", "2026-08-18T10:00:00+08:00", True)):
+            with self.subTest(ends_at=ends_at):
+                official = self.unreviewed_history_plan()
+                official["schedule"]["entries"][0].update(
+                    starts_at=starts_at, ends_at=ends_at)
+                candidate = copy.deepcopy(official)
+                candidate["schedule"]["entries"] = []
+                result, applied, _, _ = self.apply_history_candidate(candidate, official)
+                self.assertEqual(result.returncode, 0 if allowed else 1, result.stdout)
+                if not allowed:
+                    self.assertIn("unreviewed_history_removed", {e["code"] for e in json.loads(result.stdout)["errors"]})
+                    self.assertEqual(applied, official)
+
+    def test_invalid_candidate_does_not_apply_review_or_cleanup(self) -> None:
+        official = self.unreviewed_history_plan()
+        candidate = copy.deepcopy(official)
+        candidate["plan_meta"]["progress_reviewed_through"] = COMMITTED_AT
+        candidate["schedule"]["entries"] = []
+        candidate["task_structure"]["todos"][0]["status"] = "not-a-status"
+        candidate["task_structure"]["todos"][0]["updated_at"] = COMMITTED_AT
+        result, applied, _, _ = self.apply_history_candidate(candidate, official)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["error"], "validation_failed")
         self.assertEqual(applied, official)
 
     def test_existing_todo_cannot_be_physically_removed(self) -> None:

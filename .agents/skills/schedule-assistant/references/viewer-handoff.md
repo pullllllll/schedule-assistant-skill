@@ -59,7 +59,7 @@ viewer 尚未运行时，不为这些小改动启动它；收尾只说明已经�
 1. 将 Skill 目录和 workspace 解析成绝对路径。
 2. 运行 `python3 <skill>/scripts/ensure_viewer.py <workspace> --route '<route>'`。
 3. 只有脚本返回 `ok: true` 时，才把其中的 `url` 交给浏览器。
-4. 浏览器里已有该 workspace 的 viewer 标签页时复用并导航；没有时才新开。一次用户请求最多主动聚焦一次。
-5. 脚本返回 `plan_missing`、`plan_invalid`、`viewer_missing`、`dependencies_missing`、`port_conflict` 或 `start_failed` 时，不退回 fixture，也不自行安装依赖。简短报告正式计划是否已提交以及 viewer 为什么没有打开。
+4. 浏览器里已有该 workspace 的 viewer 标签页时复用并导航；没有时才新开。确认打开或导航成功后再聚焦；失败则停止这次浏览器交接，不继续聚焦或另开标签页。一次用户请求最多主动聚焦一次。
+5. 脚本返回 `plan_missing`、`plan_invalid`、`viewer_missing`、`dependencies_missing`、`port_conflict` 或 `start_failed` 时，不退回 fixture，也不自行安装依赖。运行条件未变化且失败原因尚未排除时，不重复检查或启动同一服务。简短报告正式计划是否已提交以及 viewer 为什么没有打开。
 
 `ensure_viewer.py` 只核对或启动服务，不负责打开浏览器。启动成功后复用同一服务；不为每次修改重启。打开或启动失败是展示层问题，不能撤销或误报已经成功的正式计划提交。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 import unittest
 from pathlib import Path
@@ -44,6 +45,49 @@ class DailyRankingTests(unittest.TestCase):
             ["meeting-entry", "revise-entry", "ride-am", "ride-pm"],
         )
         self.assertIn("P0", result["assignments"]["meeting-entry"]["priority_reason"])
+
+    def test_priority_reason_does_not_infer_independence_from_inactive_parents(self) -> None:
+        cases = [
+            ("independent", [], "active", [], "按正常重要性处理"),
+            ("completed-goal", [{"goal_id": "parent", "node_id": None}],
+             "completed", [], "按正常重要性处理"),
+            ("completed-cycle", [{"goal_id": "parent", "node_id": "cycle"}],
+             "active", [{"id": "cycle", "status": "completed", "deadline": None}],
+             "按正常重要性处理"),
+            ("active-parent", [{"goal_id": "parent", "node_id": None}],
+             "active", [], "所属目标最高优先级为 P2"),
+        ]
+        for name, refs, parent_status, nodes, expected_reason in cases:
+            with self.subTest(name=name):
+                subject = self.todo("subject", "parent")
+                subject["parent_refs"] = refs
+                if name.startswith("completed"):
+                    subject["status"] = "completed"
+                plan = {
+                    "plan_meta": {"timezone": "Asia/Shanghai"},
+                    "task_structure": {
+                        "goals": [
+                            {"id": "parent", "status": parent_status, "priority": "P2", "deadline": None},
+                            {"id": "urgent", "status": "active", "priority": "P0", "deadline": None},
+                        ],
+                        "nodes": nodes,
+                        "todos": [subject, self.todo("important", "urgent")],
+                    },
+                    "schedule": {"entries": [
+                        self.entry("subject-entry", "subject", "09:00", "10:00"),
+                        self.entry("important-entry", "important", "11:00", "12:00"),
+                    ]},
+                }
+                original = copy.deepcopy(plan)
+
+                result = derive_daily_rankings(plan, "2026-09-02T12:00:00+08:00")
+
+                self.assertEqual(result["assignments"]["subject-entry"]["priority_reason"], expected_reason)
+                self.assertEqual(
+                    [entry["entry_id"] for entry in result["days"]["2026-09-03"]],
+                    ["important-entry", "subject-entry"],
+                )
+                self.assertEqual(plan, original)
 
     @staticmethod
     def todo(todo_id: str, goal_id: str, depends_on: list[str] | None = None) -> dict:

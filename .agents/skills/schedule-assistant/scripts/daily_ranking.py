@@ -110,7 +110,7 @@ def _reason(signal: Dict[str, Any]) -> str:
     if signal["dependent_count"]:
         parts.append(f"解锁 {signal['dependent_count']} 个后续行动")
     priority = signal["priority_label"]
-    parts.append(f"所属目标最高优先级为 {priority}" if priority else "独立行动按正常重要性处理")
+    parts.append(f"所属目标最高优先级为 {priority}" if priority else "按正常重要性处理")
     return "；".join(parts)
 
 
@@ -159,6 +159,33 @@ def derive_daily_rankings(plan: Dict[str, Any], calculated_at: Any = None) -> Di
     goals = _indexed(structure.get("goals", []))
     nodes = _indexed(structure.get("nodes", []))
     todos = _indexed(structure.get("todos", []))
+    # Node dependencies also constrain action order. Expand only in this runtime
+    # view; do not duplicate authoritative Todo edges or write them to the plan.
+    node_children: Dict[str, Set[str]] = defaultdict(set)
+    for todo_id, todo in todos.items():
+        if todo.get("status") in {"completed", "cancelled"}:
+            continue
+        for ref in todo.get("parent_refs", []):
+            if isinstance(ref, dict) and ref.get("node_id"):
+                node_children[ref["node_id"]].add(todo_id)
+
+    def prerequisite_actions(node_id: str, visited: Set[str]) -> Set[str]:
+        node = nodes.get(node_id, {})
+        if node_id in visited or node.get("status") in {"completed", "cancelled"}:
+            return set()
+        actions = set(node_children[node_id])
+        for predecessor in node.get("depends_on_node_ids", []):
+            actions.update(prerequisite_actions(predecessor, visited | {node_id}))
+        return actions
+
+    expanded = {}
+    for todo_id, todo in todos.items():
+        dependencies = set(todo.get("depends_on_todo_ids", []))
+        for _, node in _active_parents(todo, goals, nodes):
+            for predecessor in node.get("depends_on_node_ids", []) if node else []:
+                dependencies.update(prerequisite_actions(predecessor, set()))
+        expanded[todo_id] = {**todo, "depends_on_todo_ids": sorted(dependencies - {todo_id})}
+    todos = expanded
     dependent_counts = _dependent_counts(todos)
     groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     signals: Dict[str, Dict[str, Any]] = {}
