@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildModel, layoutDayEntries, weekSlotHeight } from '../src/plan-model.js';
+import { buildModel, todoDeadlineLabel, layoutDayEntries, weekSlotHeight } from '../src/plan-model.js';
 
 function planWith(starts_at, ends_at, timezone = 'Asia/Shanghai') {
   return {
@@ -155,4 +155,14 @@ test('node outcomes and actual starts affect actionability while cycle identity 
   assert.equal(buildModel(plan, current).entryById.get('original').actionability, '现在可行动');
   plan.task_structure.nodes[0].starts_on = '2026-10-09';
   assert.equal(buildModel(plan, current).entryById.get('original').actionability, '未到可开始日期');
+});
+
+test('Todo deadline details distinguish unresolved, explicitly absent and confirmed, including legacy', () => {
+  assert.equal(todoDeadlineLabel({ deadline: null }, 'Asia/Shanghai'), '待确认');
+  assert.equal(todoDeadlineLabel({ deadline: null, deadline_status: 'pending' }, 'Asia/Shanghai'), '待确认');
+  assert.equal(todoDeadlineLabel({ deadline: null, deadline_status: 'none' }, 'Asia/Shanghai'), '不设截止');
+  const deadline = '2026-10-13T04:00:00Z';
+  const label = todoDeadlineLabel({ deadline }, 'Asia/Shanghai');
+  assert.match(label, /12:00/);
+  assert.equal(todoDeadlineLabel({ deadline, deadline_status: 'confirmed' }, 'Asia/Shanghai'), label);
 });

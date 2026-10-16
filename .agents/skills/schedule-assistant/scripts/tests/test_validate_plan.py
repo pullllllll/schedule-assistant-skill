@@ -110,6 +110,24 @@ class ValidatePlanTests(unittest.TestCase):
     def codes(self, result: dict, level: str = "errors") -> set[str]:
         return {item["code"] for item in result[level]}
 
+    def test_deadline_status_compatibility_and_consistency(self) -> None:
+        for state, deadline, valid in [
+            (None, None, True), (None, "2026-08-23T18:00:00+08:00", True),
+            ("pending", None, True), ("none", None, True),
+            ("confirmed", "2026-08-23T18:00:00+08:00", True),
+            ("confirmed", None, False), ("pending", "2026-08-23T18:00:00+08:00", False),
+            ("none", "2026-08-23T18:00:00+08:00", False), ("unknown", None, False),
+        ]:
+            with self.subTest(state=state, deadline=deadline):
+                plan = empty_plan()
+                item = base_todo()
+                item["deadline"] = deadline
+                if state is not None:
+                    item["deadline_status"] = state
+                plan["task_structure"]["todos"] = [item]
+                code, result = self.validate(plan)
+                self.assertEqual(code == 0, valid, result)
+
     def test_empty_plan_is_valid(self) -> None:
         code, result = self.validate(empty_plan())
         self.assertEqual(code, 0, result)

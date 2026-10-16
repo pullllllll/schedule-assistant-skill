@@ -473,7 +473,8 @@ class Validator:
         habit_identities: Set[Tuple[str, str, int]] = set()
         for index, todo in enumerate(todos):
             path = f"$.task_structure.todos[{index}]"
-            if not self.object_fields(todo, path, TODO_FIELDS):
+            fields = TODO_FIELDS | ({"deadline_status"} if isinstance(todo, dict) and "deadline_status" in todo else set())
+            if not self.object_fields(todo, path, fields):
                 continue
             todo_id = todo.get("id")
             self.unique_id(todo_id, f"{path}.id", self.todos, todo)
@@ -481,6 +482,10 @@ class Validator:
             status = todo.get("status")
             self.enum(status, f"{path}.status", {"pending", "in_progress", "completed", "cancelled"})
             self.datetime(todo.get("deadline"), f"{path}.deadline", nullable=True)
+            deadline_status = todo.get("deadline_status", "confirmed" if todo.get("deadline") is not None else "pending")
+            if self.enum(deadline_status, f"{path}.deadline_status", {"pending", "confirmed", "none"}):
+                if (deadline_status == "confirmed") != (todo.get("deadline") is not None):
+                    self.error("deadline_status_mismatch", f"{path}.deadline_status", "confirmed requires a deadline; pending and none require null")
             remaining = todo.get("remaining_estimate_minutes")
             if self.integer(remaining, f"{path}.remaining_estimate_minutes"):
                 if status in {"completed", "cancelled"} and remaining != 0:

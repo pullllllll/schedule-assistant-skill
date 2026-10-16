@@ -430,3 +430,9 @@ export function buildModel(plan, now = new Date()) {
     clock,
   };
 }
+
+// Legacy null means unresolved, never an explicit decision to omit a deadline.
+export function todoDeadlineLabel(todo, timezone) {
+  if (todo.deadline) return new Date(todo.deadline).toLocaleString("zh-CN", { timeZone: timezone });
+  return todo.deadline_status === "none" ? "不设截止" : "待确认";
+}

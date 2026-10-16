@@ -210,6 +210,26 @@ class ApplyPlanTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["error"], "incremental_discovery_required")
         self.assertEqual(applied, official)
 
+    def test_deadline_status_survives_commit_and_rejects_inconsistent_candidate(self) -> None:
+        official = empty_plan()
+        official["task_structure"]["goals"] = [linear_goal()]
+        for state, deadline, valid in [
+            ("pending", None, True), ("none", None, True),
+            ("confirmed", "2026-08-23T18:00:00+08:00", True),
+            ("confirmed", None, False),
+        ]:
+            with self.subTest(state=state, deadline=deadline):
+                candidate = copy.deepcopy(official)
+                item = todo()
+                item.update(deadline_status=state, deadline=deadline)
+                candidate["task_structure"]["todos"] = [item]
+                result, applied, _, _ = self.run_apply(candidate, official)
+                self.assertEqual(result.returncode == 0, valid, result.stdout)
+                if valid:
+                    self.assertEqual(applied["task_structure"]["todos"][0]["deadline_status"], state)
+                else:
+                    self.assertEqual(applied, official)
+
     def test_explicit_independent_todo_does_not_require_incremental_discovery(self) -> None:
         official = empty_plan()
         official["task_structure"]["goals"] = [linear_goal()]
@@ -524,6 +544,29 @@ class ApplyPlanTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0 if allowed else 1, result.stdout)
                 if allowed:
                     self.assertEqual(applied["schedule"]["entries"], [])
+                else:
+                    self.assertIn("unreviewed_history_removed", {e["code"] for e in json.loads(result.stdout)["errors"]})
+                    self.assertEqual(applied, official)
+
+    def test_obsolete_unstarted_entry_cleanup_requires_review_and_keeps_task(self) -> None:
+        for reviewed in (False, True):
+            with self.subTest(reviewed=reviewed):
+                official = self.unreviewed_history_plan()
+                candidate = copy.deepcopy(official)
+                candidate["task_structure"]["todos"][0].update(
+                    status="cancelled", remaining_estimate_minutes=0,
+                    context="User confirmed this occurrence never started and the obsolete action is replaced.",
+                    updated_at=COMMITTED_AT)
+                candidate["schedule"]["entries"] = []
+                if reviewed:
+                    candidate["plan_meta"]["progress_reviewed_through"] = COMMITTED_AT
+                result, applied, _, _ = self.apply_history_candidate(candidate, official)
+                self.assertEqual(result.returncode, 0 if reviewed else 1, result.stdout)
+                if reviewed:
+                    self.assertEqual(applied["schedule"]["entries"], [])
+                    self.assertEqual(applied["task_structure"]["todos"][0]["id"], "todo-a")
+                    self.assertEqual(applied["task_structure"]["todos"][0]["status"], "cancelled")
+                    self.assertEqual(applied["task_structure"]["todos"][1], official["task_structure"]["todos"][1])
                 else:
                     self.assertIn("unreviewed_history_removed", {e["code"] for e in json.loads(result.stdout)["errors"]})
                     self.assertEqual(applied, official)

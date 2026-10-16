@@ -1,5 +1,7 @@
 import "./styles.css";
-import { buildModel, habitDisplayGroups, layoutDayEntries, recurringDetails, weekSlotHeight } from "./plan-model.js";
+import { buildModel, todoDeadlineLabel, layoutDayEntries, recurringDetails, weekSlotHeight } from "./plan-model.js";
+
+import { todoScheduleDates, relationRows, visibleRelations } from "./relation-view.js";
 
 const PLAN_URL = "/plan.json";
 const POLL_MS = 5000;
@@ -139,10 +141,10 @@ function topbar() {
   const brand = `<div class="brand-lockup"><span class="brand-mark">今</span><strong>日程小助手</strong></div>`;
   const right = `<button class="icon-button refresh-button ${state.refreshing ? "is-busy" : ""}" data-retry aria-label="重新读取正式计划">↻</button>`;
   if (state.page === "relations") {
-    const goals = model.goals.filter(goal => goal.status !== "cancelled");
+    const { goals, nodes, todos } = visibleRelations(model);
     return `<header class="topbar relation-topbar">
       <div class="topbar-left relation-topbar-left">${brand}${nav}
-        <span class="relation-counts"><strong>${goals.length}</strong> 个目标 · <strong>${model.nodes.length}</strong> 个节点 · <strong>${model.todos.length}</strong> 个行动</span>
+        <span class="relation-counts"><strong>${goals.length}</strong> 个目标 · <strong>${nodes.length}</strong> 个节点 · <strong>${todos.length}</strong> 个行动</span>
       </div>
       ${relationModeSwitch()}
       <div class="topbar-right relation-topbar-right">${relationCanvasActions()}${right}</div>
@@ -276,8 +278,6 @@ function prioritiesPanel() {
 
 /* ── 关系面板：底部展开，与日程同屏 ─────────────────────── */
 /* ── 详情抽屉 ───────────────────────────────────────────── */
-const ddlTime = object => object?.deadline ? new Date(object.deadline).getTime() : Number.POSITIVE_INFINITY;
-const byDDL = (a, b) => ddlTime(a) - ddlTime(b) || String(a.created_at || "").localeCompare(String(b.created_at || ""));
 const shortDate = value => value ? new Intl.DateTimeFormat("zh-CN", {
   timeZone: model.timezone, month: "numeric", day: "numeric",
 }).format(new Date(value)) : "未设 DDL";
@@ -300,6 +300,8 @@ function cleanCircle(object, kind, { meta = "", expandable = false, visualOnly =
             : "<span>行动</span>";
   const derivedMeta = kind === "goal"
     ? [object.priority, status].filter(Boolean).join(" · ")
+    : kind === "todo"
+      ? todoScheduleDates(model, object)
     : kind === "period"
       ? status
       : [status, object.deadline ? `DDL ${shortDate(object.deadline)}` : ""].filter(Boolean).join(" · ");
@@ -325,30 +327,7 @@ function goalDetailTrigger(goal) {
 }
 
 function cleanTreeData(goal) {
-  const nodes = model.nodes.filter(node => node.goal_id === goal.id).sort(byDDL);
-  const directTodos = model.todos.filter(todo => todo.parent_refs.some(ref => ref.goal_id === goal.id && ref.node_id == null));
-  const rows = [];
-  if (goal.type === "habit") {
-    for (const group of habitDisplayGroups(goal, directTodos)) {
-      rows.push({
-        kind: "period",
-        object: { id: group.id, title: group.title, status: "pending" },
-        todos: group.todos,
-      });
-    }
-  } else {
-    const main = [
-      ...nodes.map(object => ({ kind: "node", object })),
-      ...directTodos.map(object => ({ kind: "todo", object })),
-    ].sort((a, b) => byDDL(a.object, b.object));
-    for (const item of main) {
-      if (item.kind === "node") {
-        rows.push({ ...item,
-          todos: model.todos.filter(todo => todo.parent_refs.some(ref => ref.goal_id === goal.id && ref.node_id === item.object.id)).sort(byDDL),
-        });
-      } else rows.push({ ...item, todos: [] });
-    }
-  }
+  const rows = relationRows(model, goal);
   const maxTodos = Math.max(0, ...rows.map(row => row.todos.length));
   // Goal 保持圆形；Node 使用横向圆角矩形；Todo 使用胶囊。这里按真实形状
   // 预留横向空间，避免只改 CSS 后长标题卡片与后续行动、连线互相挤压。
@@ -393,6 +372,7 @@ function relationFocusItem(kind, object) {
   const active = state.relationFocusKind === kind && state.relationFocusId === object.id;
   const secondary = kind === "goal"
     ? `${TYPE_LABEL[object.type] || object.type}${object.priority ? ` · ${object.priority}` : ""}`
+    : kind === "todo" ? `DDL ${todoDeadlineLabel(object, model.timezone)}`
     : (object.deadline ? `DDL ${shortDate(object.deadline)}` : "无 DDL");
   return `<button class="relation-focus-item ${active ? "is-active" : ""} ${object.status === "completed" ? "is-done" : ""}"
       data-focus-object="${kind}:${object.id}" aria-current="${active ? "true" : "false"}">
@@ -451,7 +431,7 @@ function relationFocusView(goals, standalone) {
 function cleanCanvasLayout(goals, standalone) {
   const all = [
     ...goals.map(goal => ({ kind: "goal", object: goal, width: 144, height: 144 })),
-    ...standalone.map(todo => ({ kind: "todo", object: todo, width: 182, height: 60 })),
+    ...standalone.map(todo => ({ kind: "todo", object: todo, width: 182, height: 76 })),
   ];
   const compactHomes = [
     [250, 230], [620, 118], [826, 390], [500, 510], [930, 150], [170, 500],
@@ -505,8 +485,7 @@ function cleanCanvasLayout(goals, standalone) {
 }
 
 function relationsPage() {
-  const goals = model.goals.filter(goal => goal.status !== "cancelled");
-  const standalone = model.todos.filter(todo => !todo.parent_refs.length && todo.status !== "cancelled").sort(byDDL);
+  const { goals, standalone } = visibleRelations(model);
   const layout = state.relationMode === "canvas" ? cleanCanvasLayout(goals, standalone) : null;
   return `<section class="main-view relation-page clean-relation-page" aria-label="任务总览无限画布">
     ${state.relationMode === "focus" ? relationFocusView(goals, standalone) : `<div class="relation-canvas" data-canvas-stage tabindex="0">
@@ -536,7 +515,7 @@ function drawerBody() {
         e.priority ? ["优先级", `${e.priority}（取有效所属目标中最高）`] : null,
         e.parents?.length ? ["所属结构", e.parents.map(p => `${esc(p.goalTitle)}${p.nodeTitle ? " › " + esc(p.nodeTitle) : ""}`).join("<br/>")] : null,
         e.remainingMinutes != null ? ["剩余工作量", `${e.remainingMinutes} 分钟`] : null,
-        e.deadline ? ["DDL", new Date(e.deadline).toLocaleString("zh-CN", { timeZone: model.timezone })] : null,
+        e.sourceType === "todo" ? ["DDL", todoDeadlineLabel(model.todoById.get(e.entityId), model.timezone)] : null,
         e.context ? ["背景", esc(e.context)] : null,
       ].filter(Boolean),
     };
@@ -570,7 +549,7 @@ function drawerBody() {
       ["剩余工作量", `${o.remaining_estimate_minutes} 分钟`],
       ["执行方式", o.execution_mode === "single_block" ? "需要整块时间" : "可拆分"], ["强度", o.intensity],
       parents.length ? ["所属结构", parents.map(p => `${esc(p.goalTitle)}${p.nodeTitle ? " › " + esc(p.nodeTitle) : ""}`).join("<br/>")] : ["所属", "独立行动"],
-      o.deadline ? ["DDL", new Date(o.deadline).toLocaleString("zh-CN", { timeZone: model.timezone })] : null,
+      ["DDL", todoDeadlineLabel(o, model.timezone)],
       o.depends_on_todo_ids.length ? ["前置行动", o.depends_on_todo_ids.map(id => esc(model.todoById.get(id)?.title ?? id)).join("<br/>")] : null,
       ["已排期", scheduled.length ? scheduled.map(e => e.fullTimeLabel).join("<br/>") : "尚未排期"],
       o.context ? ["背景", esc(o.context)] : null,
@@ -1081,9 +1060,8 @@ async function load({ silent = false } = {}) {
     model = buildModel(await response.json());
     const requestedDate = state.anchorDate || params.get("date") || model.focusDate;
     state.anchorDate = state.view === "week" ? clampToWeekBrowseRange(requestedDate) : clampToWindow(requestedDate);
-    const visibleGoals = model.goals.filter(goal => goal.status !== "cancelled");
+    const { goals: visibleGoals, standalone } = visibleRelations(model);
     const visibleGoalIds = new Set(visibleGoals.map(goal => goal.id));
-    const standalone = model.todos.filter(todo => !todo.parent_refs.length && todo.status !== "cancelled").sort(byDDL);
     if (!state.relationInitialized) {
       state.collapsedGoals = new Set(visibleGoals.map(goal => goal.id));
       const requestedFocus = params.get("focus")?.split(":");

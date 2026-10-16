@@ -411,7 +411,7 @@ button:focus-visible { outline: 2px solid color-mix(in oklch, var(--accent-focus
 .focus-item-orb.is-todo { width: 11px; height: 11px; margin-left: 1.5px; }
 .relation-focus-stage { min-width: 0; min-height: 0; }
 .focus-canvas-world { overflow: visible; }
-.focus-single-circle .circle-todo { width: 182px; height: 60px; }
+.focus-single-circle .circle-todo { width: 182px; height: 76px; }
 .focus-single-circle .circle-todo strong { font-size: 10px; }
 .focus-empty { position: absolute; left: 50%; top: 50%; margin: 0; transform: translate(-50%, -50%); color: var(--muted); font-size: 12px; }
 .clean-canvas-world { transition: transform .24s cubic-bezier(.2,.75,.25,1); }
@@ -458,11 +458,12 @@ button:focus-visible { outline: 2px solid color-mix(in oklch, var(--accent-focus
 .circle-goal strong { -webkit-line-clamp: 3; font-size: 13px; }
 .circle-node, .circle-period { width: 168px; height: 76px; border-radius: 22px; }
 .circle-node strong, .circle-period strong { display: block; max-width: 100%; overflow: hidden; overflow-wrap: normal; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.circle-todo { width: 182px; height: 60px; align-items: flex-start; gap: 3px; padding: 7px 18px; border-radius: 999px; text-align: left; }
+.circle-todo { width: 182px; height: 76px; align-items: flex-start; gap: 3px; padding: 7px 18px; border-radius: 999px; text-align: left; }
 .circle-todo .circle-identity { justify-content: flex-start; }
-.circle-todo strong { display: block; max-width: 100%; overflow: hidden; font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
+.circle-todo strong { display: -webkit-box; -webkit-line-clamp: 2; max-width: 100%; overflow: hidden; font-size: 9.5px; white-space: normal; flex-shrink: 0; }
+.circle-todo .circle-identity, .circle-todo .circle-meta { flex-shrink: 0; }
 .circle-todo:hover { --hover-scale: 1.15; }
-.relation-circle.is-shared { border-style: double; border-width: 4px; box-shadow: 0 0 0 2px color-mix(in oklch, var(--circle-tone) 12%, transparent); }
+.relation-circle.is-shared { border-style: solid; outline: 1px solid var(--circle-tone); outline-offset: 2px; box-shadow: 0 0 0 2px color-mix(in oklch, var(--circle-tone) 12%, transparent); }
 .relation-circle.is-done { filter: saturate(.18); opacity: .46; }
 .relation-circle.is-done strong { text-decoration: none; }
 .floating-circle { position: absolute; left: var(--float-x); top: var(--float-y); animation: canvas-float var(--float-duration, 7s) ease-in-out var(--float-delay, 0s) infinite; will-change: transform; }

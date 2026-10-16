@@ -317,6 +317,7 @@ Node 不保存 Todo ID 列表、进度比例、总估时、逾期、完成时间
 | `parent_refs` | array<object> | 是 | 可为空；多个引用表示共享 Todo |
 | `status` | enum | 是 | `pending`、`in_progress`、`completed`、`cancelled` |
 | `deadline` | datetime/null | 是 | Todo 自身经确认的精确 DDL |
+| `deadline_status` | enum | 新增/调整截止时必填 | `pending`、`confirmed`、`none`；旧记录允许省略 |
 | `execution_window` | object | 是 | 原始弹性时间窗 |
 | `remaining_estimate_minutes` | integer | 是 | 当前预计仍需安排的分钟数，非负 |
 | `execution_mode` | enum | 是 | `single_block` 或 `splittable` |
@@ -334,6 +335,8 @@ Node 不保存 Todo ID 列表、进度比例、总估时、逾期、完成时间
 | `ends_at` | datetime | 是 |
 
 用户没有提供 `execution_window` 时，Agent 可以根据已知 DDL、依赖、剩余工作量、可用时间和协作条件直接推导并写入，不因该字段必填而单独追问。窗口选择会改变可执行性或产生重要取舍时，才需要追问或随任务结构方案确认；直接推导时应向用户说明。
+
+`confirmed` 必须配非空精确 deadline；`pending`（未确认）和 `none`（用户明确不设）必须配 null。none 只表示不设自身截止，不解除有效上层截止。旧记录缺字段时，非空 deadline 按 confirmed、null 按 pending 读取，不改源数据；旧 context 中明确的不设截止决定可在相关更新时转成 none，不重复询问。新增及实际调整截止语义时显式写状态，单纯移动时间不改状态。候选状态只记录确认结果，不记录问过几次；建议及待确认原因可简记 context。
 
 完成或取消的 Todo，`remaining_estimate_minutes` 必须为 0。
 
